@@ -5,6 +5,7 @@
       <el-menu router default-active="/dashboard" background-color="#1f2d3d" text-color="#bfcbd9" active-text-color="#409eff">
         <el-menu-item index="/dashboard"><el-icon><DataBoard /></el-icon>仪表板</el-menu-item>
         <el-menu-item index="/alerts"><el-icon><Warning /></el-icon>告警列表</el-menu-item>
+        <el-menu-item index="/approvals"><el-icon><Stamp /></el-icon>人工审批</el-menu-item>
         <el-menu-item index="/tasks"><el-icon><List /></el-icon>任务管理</el-menu-item>
         <el-menu-item index="/tools"><el-icon><Tools /></el-icon>工具管理</el-menu-item>
         <el-menu-item index="/realtime"><el-icon><Connection /></el-icon>实时监控</el-menu-item>

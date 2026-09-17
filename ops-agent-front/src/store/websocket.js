@@ -4,12 +4,16 @@ export const useWebSocketStore = defineStore('websocket', {
   state: () => ({
     ws: null,
     connected: false,
-    messages: []
+    messages: [],
+    lastTaskId: ''
   }),
   actions: {
     connect(taskId) {
+      if (this.ws && this.lastTaskId === taskId) return
       if (this.ws) this.disconnect()
-      const url = `${import.meta.env.VITE_WS_BASE_URL}/ws/agent?taskId=${taskId}`
+      this.lastTaskId = taskId
+      const token = localStorage.getItem('token') || ''
+      const url = `${import.meta.env.VITE_WS_BASE_URL}/ws/agent?taskId=${taskId}${token ? `&token=${encodeURIComponent(token)}` : ''}`
       this.ws = new WebSocket(url)
       this.ws.onopen = () => {
         this.connected = true

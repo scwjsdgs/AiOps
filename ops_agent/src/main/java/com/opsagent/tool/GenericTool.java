@@ -33,7 +33,7 @@ public class GenericTool implements Tool {
 
     @Override
     public String getDescription() {
-        return "Execute any shell command on the local host.";
+        return "在本地主机上执行任意 shell 命令。";
     }
 
     @Override

@@ -17,7 +17,7 @@ public class RestartServiceTool extends KubernetesToolBase implements Tool {
 
     @Override
     public String getDescription() {
-        return "Restart a deployment by scaling down to 0 then back to the original replica count.";
+        return "通过先将副本缩容到 0、再恢复到原始副本数来重启 Deployment。";
     }
 
     @Override

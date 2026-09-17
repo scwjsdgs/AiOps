@@ -3,6 +3,7 @@ package com.opsagent.service;
 import com.opsagent.model.AgentMessage;
 import com.opsagent.model.ToolExecutionRequest;
 import com.opsagent.model.ToolExecutionResult;
+import com.opsagent.repository.AlertRepository;
 import io.github.resilience4j.bulkhead.annotation.Bulkhead;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
@@ -25,6 +26,7 @@ public class AgentCallbackService {
     private final ToolRegistryService toolRegistry;
     private final TaskSchedulerService taskScheduler;
     private final WebSocketPushService webSocketPushService;
+    private final AlertRepository alertRepository;
     private final WebClient webClient;
 
     @Value("${opsagent.agent.url:http://localhost:5000}")
@@ -106,7 +108,53 @@ public class AgentCallbackService {
      *               一个失败的分析在界面上看起来是"已完成"。
      */
     public Mono<Void> taskComplete(String taskId, String result, String status) {
-        return taskScheduler.completeTask(taskId, result, status).then();
+        return taskScheduler.completeTask(taskId, result, status)
+                // 任务落终态后，把终态回写到关联告警。改造前这里就断了：
+                // 告警永远停在 ANALYZING，列表里所有告警看起来"永远在分析中"，
+                // Dashboard 的"已处理"统计也对不上。
+                .then(markRelatedAlert(taskId, status))
+                .then();
+    }
+
+    /**
+     * 任务终态 -> 告警终态：SUCCESS 映射 RESOLVED，FAILED 映射 FAILED。
+     * 任务可能没有关联告警（手动巡检、工具演练），查不到 alertId 就跳过。
+     */
+    private Mono<Void> markRelatedAlert(String taskId, String taskStatus) {
+        String alertStatus = "SUCCESS".equals(taskStatus) ? "RESOLVED" : "FAILED";
+        boolean processed = "SUCCESS".equals(taskStatus);
+        return taskScheduler.getTask(taskId)
+                .flatMap(task -> {
+                    String alertId = task.getAlertId();
+                    if (alertId == null || alertId.isBlank()) {
+                        return Mono.empty();
+                    }
+                    // alertRepository 是阻塞 JPA（findById 返回 Optional 不是 Mono）��
+                    // 必须包进 fromCallable 并挪到 boundedElastic，
+                    // 否则跑在 event loop 上，还会把 Optional 当 Reactor 类型编译失败
+                    return Mono.fromCallable(() -> {
+                                alertRepository.findById(alertId).ifPresent(alert -> {
+                                    // 只从 ANALYZING 推进到终态，不覆盖更早的状态语义
+                                    alert.setStatus(alertStatus);
+                                    alert.setProcessed(processed);
+                                    alertRepository.save(alert);
+                                });
+                                log.info("任务 {} 终态 {} 已回写告警 {}", taskId, taskStatus, alertId);
+                                return true;
+                            })
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .onErrorResume(e -> {
+                                log.error("回写告警终态失败 alertId={} taskId={}", alertId, taskId, e);
+                                return Mono.just(false);
+                            })
+                            .then();
+                })
+                // 任务不存在（Redis 已过期等）不影响任务完成回调本身
+                .onErrorResume(e -> {
+                    log.warn("回写告警终态时任务查询失败 taskId={}", taskId, e);
+                    return Mono.empty();
+                })
+                .then();
     }
 
     /** 把 AgentMessage 压成一行便于前端展示与排查的摘要。 */

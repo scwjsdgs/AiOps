@@ -50,7 +50,7 @@ public class QueryLogTool implements Tool {
 
     @Override
     public String getDescription() {
-        return "Query recent logs of a service over SSH, with an optional keyword filter.";
+        return "通过 SSH 查询服务的最近日志，可附带关键字过滤。";
     }
 
     @Override

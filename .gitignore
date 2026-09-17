@@ -1,41 +1,113 @@
-# 忽略 AI 工具配置
+# ==========================================
+# 1. AI 工具配置 (按需忽略)
+# ==========================================
 .claude/
 .claudeignore
+CLAUDE.md
 
-# Java 编译产物
+# ==========================================
+# 2. Java / Maven 编译产物
+# ==========================================
 target/
 *.class
-# *.jar   ← 删掉这行，或改成下面这样
 *.jar
+# 必须保留 Maven Wrapper，保证团队其他人无需安装 Maven 即可构建
 !.mvn/wrapper/maven-wrapper.jar
+# 其他 Java 打包产物
+*.war
+*.ear
+*.nar
+# JVM 崩溃日志
+hs_err_pid*
+replay_pid*
+# Maven 临时文件
+.mvn/timing.properties
 
-# Python 缓存
+# ==========================================
+# 3. Python 缓存与打包 (针对 aiops-agent / ops_agent)
+# ==========================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 venv/
 env/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.egg-info/
+.eggs/
+*.whl
 
-# 前端依赖
+# ==========================================
+# 4. 前端依赖与构建 (针对 ops-agent-front)
+# ==========================================
 node_modules/
 dist/
 build/
+# 前端框架缓存
+.nuxt/
+.next/
+.cache/
+*.tsbuildinfo
+# 包管理器缓存
+.yarn/install-state.gz
+.pnpm-store/
 
-# 敏感环境变量
+# ==========================================
+# 5. 敏感环境变量与本地配置 (最重要！)
+# ==========================================
 .env
 .env.local
+.env.*.local
+# 如果你想保留一个示例文件，可以加：!.env.example
 application-prod.yml
+application-dev.yml
+application-local.yml
+application-test.yml
+bootstrap-local.yml
+# 密钥与证书
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+# 本地数据库文件与备份 (防止把本地数据推上去)
+*.sql
+*.sqlite3
+*.db
 
-# IDE
-.idea/
-.vscode/
-*.iml
-.DS_Store
-
-# 日志
+# ==========================================
+# 6. 日志文件
+# ==========================================
 *.log
 logs/
+# 特别注意：截图里出现的这个 MySQL 本地日志，千万别提交
+mysqld.log
 
-# Maven
-.mvn/timing.properties
+# ==========================================
+# 7. IDE 与编辑器配置
+# ==========================================
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+.history/
 
-CLAUDE.md
+# ==========================================
+# 8. 操作系统文件
+# ==========================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+
+# 向量数据库与本地缓存
+*.sqlite3
+chroma_db/
+memory_storage/
+aiops-agent/memory_storage/

@@ -69,10 +69,22 @@ opsagent:
     # 允许 AI agent 调用的工具白名单。
     # generic_command（可执行任意 shell 命令）刻意不在其中：工具本身保留，
     # 仍会出现在 /api/tools/list 里，但不暴露给大模型。
-    agent-exposed: restart_service,scale_up,query_log,get_status,rollback,clear_cache,request_human_approval
+    agent-exposed: restart_service,scale_up,query_log,get_status,rollback,clear_cache,request_human_approval,query_metrics,query_pod_events
   approval:
     # auto：立即批准但落审计记录；manual：挂起等待外部审批（需要前端配合）
-    mode: auto
+    mode: manual
+  webhook:
+    # Alertmanager Webhook 自身认证令牌：请求必须携带 X-Webhook-Token，
+    # 与 Alertmanager 的 http_config.headers 配置保持一致。留空表示不校验（仅本地调试用）。
+    token: ${OPSAGENT_WEBHOOK_TOKEN:dev-webhook-token}
+    # 可选 HMAC 签名密钥：配置后要求请求携带 X-Signature 头。留空表示不启用。
+    hmac:
+      secret: ${OPSAGENT_WEBHOOK_HMAC_SECRET:}
+    # 幂等去重：fingerprint = alertname + instance + severity，
+    # Redis SETNX，TTL 内同一 fingerprint 不重复触发分析。
+    idempotency:
+      ttlMinutes: 5
+    fingerprint-keys: alertname,instance,severity
   log:
     # SSH 取日志失败时的本地降级目录，留空表示不降级
     local-dir: ""
@@ -84,6 +96,10 @@ opsagent:
     clear-command: "rm -rf /tmp/app-cache/*"
   kubernetes:
     namespace: default
+  prometheus:
+    # kind 集群里的 Prometheus 通过 NodePort 或 port-forward 暴露；
+    # Java 后端跑在宿主机上，所以默认走宿主机端口
+    url: http://localhost:9090
   ssh:
     host: localhost
     port: 22

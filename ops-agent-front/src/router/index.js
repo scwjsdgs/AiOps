@@ -11,6 +11,7 @@ const routes = [
       { path: '', redirect: '/dashboard' },
       { path: 'dashboard', component: () => import('@/views/Dashboard.vue') },
       { path: 'alerts', component: () => import('@/views/Alerts.vue') },
+      { path: 'approvals', component: () => import('@/views/Approvals.vue') },
       { path: 'tasks', component: () => import('@/views/Task.vue') },
       { path: 'tools', component: () => import('@/views/Tool.vue') },
       { path: 'realtime', component: () => import('@/views/RealTime.vue') }

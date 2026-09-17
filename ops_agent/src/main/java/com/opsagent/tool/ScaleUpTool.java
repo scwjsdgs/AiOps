@@ -21,7 +21,7 @@ public class ScaleUpTool extends KubernetesToolBase implements Tool {
 
     @Override
     public String getDescription() {
-        return "Scale a deployment to a target replica count.";
+        return "将 Deployment 扩容到目标副本数。";
     }
 
     @Override

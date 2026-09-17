@@ -43,4 +43,12 @@ public class AlertEntity {
 
     @Column(name = "create_time")
     private LocalDateTime createTime;
+
+    /**
+     * Alertmanager 告警指纹（alertname|instance|severity）。
+     * resolved 事件靠它找回 firing 时落库的那条记录；没有它 resolved 只能盲目按 ID 找，
+     * 而 ID 是随机 UUID，永远对不上。
+     */
+    @Column(name = "fingerprint")
+    private String fingerprint;
 }

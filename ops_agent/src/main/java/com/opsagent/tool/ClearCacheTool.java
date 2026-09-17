@@ -50,7 +50,7 @@ public class ClearCacheTool extends KubernetesToolBase implements Tool {
 
     @Override
     public String getDescription() {
-        return "Clear a service's cache (exec into the pod, rolling restart, or over SSH).";
+        return "清除服务的缓存（通过进入 Pod、滚动重启或 SSH 执行）。";
     }
 
     @Override

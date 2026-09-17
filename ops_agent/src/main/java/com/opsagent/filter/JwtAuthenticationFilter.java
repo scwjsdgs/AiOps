@@ -55,12 +55,31 @@ public class JwtAuthenticationFilter implements WebFilter {
         }
 
         // 4) WebSocket 握手。浏览器的 WebSocket API 无法携带 Authorization 头，
-        //    若在这里拦下，前端实时监控页永远连不上。
+        //    前端约定把 JWT 放在 query string 的 token 参数里（/ws/agent?taskId=xxx&token=yyy）。
+        //    放空等于任何人连上就能看所有任务的推理过程，必须校验。
         if (path.equals("/ws/agent")) {
+            String wsToken = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+            if (wsToken == null || !wsToken.startsWith("Bearer ")) {
+                // 没带头时从 query string 里取 token
+                wsToken = queryParam(exchange, "token");
+            }
+            if (wsToken != null && wsToken.startsWith("Bearer ")) {
+                wsToken = wsToken.substring(7);
+            }
+            if (wsToken == null || !jwtUtil.validateToken(wsToken)) {
+                log.warn("WebSocket 握手校验失败: uri={}", exchange.getRequest().getURI());
+                return unauthorized(exchange, "invalid websocket token");
+            }
             return chain.filter(exchange);
         }
 
-        // 5) Python agent 的回调接口。
+        // 5) Alertmanager Webhook：自身带 X-Webhook-Token 校验（Controller 内），
+        //    这里放行路由，不校验 JWT（Alertmanager 无法携带 JWT）。
+        if (path.equals("/api/alerts/webhook")) {
+            return chain.filter(exchange);
+        }
+
+        // 6) Python agent 的回调接口。
         //    用内部共享密钥校验，而不是直接放行 —— 这些接口能触发 restart/scale
         //    等真实运维操作，放空等于给内网任何人一个远程执行入口。
         if (path.startsWith("/api/agent/callback/")) {
@@ -72,7 +91,7 @@ public class JwtAuthenticationFilter implements WebFilter {
             return unauthorized(exchange, "invalid internal token");
         }
 
-        // 6) 其余请求走 Bearer JWT
+        // 7) 其余请求走 Bearer JWT
         String authHeader = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             return unauthorized(exchange, "missing bearer token");
@@ -85,6 +104,25 @@ public class JwtAuthenticationFilter implements WebFilter {
 
         exchange.getAttributes().put("username", jwtUtil.getUsernameFromToken(token));
         return chain.filter(exchange);
+    }
+
+    /** 从 query string 里取指定参数值（WebSocket 握手的 token 用）。 */
+    private String queryParam(ServerWebExchange exchange, String name) {
+        String query = exchange.getRequest().getURI().getQuery();
+        if (query == null || query.isBlank()) {
+            return null;
+        }
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq > 0 && name.equals(pair.substring(0, eq))) {
+                try {
+                    return java.net.URLDecoder.decode(pair.substring(eq + 1), java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception e) {
+                    return pair.substring(eq + 1);
+                }
+            }
+        }
+        return null;
     }
 
     /**

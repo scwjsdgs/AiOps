@@ -33,6 +33,15 @@ request.interceptors.response.use(
     return res
   },
   error => {
+    // 后端 JWT 过滤器返回的是 HTTP 401 状态码（非 2xx），axios 走的是这里
+    // 而不是上面的成功回调 —— 必须在这里做登出跳转，否则 token 失效后
+    // 用户会被卡在页面上，所有请求反复 401 也回不到登录页。
+    if (error.response?.status === 401) {
+      const userStore = useUserStore()
+      userStore.logout()
+      window.location.href = '/login'
+      return Promise.reject(error)
+    }
     ElMessage.error(error.message || '网络错误')
     return Promise.reject(error)
   }

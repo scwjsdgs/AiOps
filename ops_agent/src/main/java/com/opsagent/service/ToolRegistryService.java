@@ -33,6 +33,8 @@ public class ToolRegistryService {
     private final RollbackTool rollbackTool;
     private final ClearCacheTool clearCacheTool;
     private final HumanApprovalTool humanApprovalTool;
+    private final QueryMetricsTool queryMetricsTool;
+    private final PodEventsTool podEventsTool;
 
     private final MeterRegistry meterRegistry;
 
@@ -57,6 +59,8 @@ public class ToolRegistryService {
         registerTool(rollbackTool);
         registerTool(clearCacheTool);
         registerTool(humanApprovalTool);
+        registerTool(queryMetricsTool);
+        registerTool(podEventsTool);
 
         agentExposed = Arrays.stream(agentExposedConfig.split(","))
                 .map(String::trim)

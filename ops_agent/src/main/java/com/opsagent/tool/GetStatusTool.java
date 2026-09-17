@@ -28,7 +28,7 @@ public class GetStatusTool extends KubernetesToolBase implements Tool {
 
     @Override
     public String getDescription() {
-        return "Get the running status of a deployment: replicas, ready replicas, image, conditions.";
+        return "获取 Deployment 的运行状态：副本数、就绪副本数、镜像、状态条件。";
     }
 
     @Override

@@ -34,7 +34,7 @@ public class RollbackTool extends KubernetesToolBase implements Tool {
 
     @Override
     public String getDescription() {
-        return "Roll a deployment back to its previous image revision (or a specified tag).";
+        return "将 Deployment 回滚到上一个镜像版本（或指定的 Tag）。";
     }
 
     @Override
