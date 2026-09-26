@@ -69,10 +69,39 @@ opsagent:
     # 允许 AI agent 调用的工具白名单。
     # generic_command（可执行任意 shell 命令）刻意不在其中：工具本身保留，
     # 仍会出现在 /api/tools/list 里，但不暴露给大模型。
-    agent-exposed: restart_service,scale_up,query_log,get_status,rollback,clear_cache,request_human_approval,query_metrics,query_pod_events
+    agent-exposed: restart_service,scale_up,query_log,get_status,rollback,clear_cache,request_human_approval,query_metrics,query_pod_events,query_impact
   approval:
     # auto：立即批准但落审计记录；manual：挂起等待外部审批（需要前端配合）
     mode: manual
+  # 前瞻性增强一：指标基线学习 + 异常预警。
+  # 周期采集各 Deployment 的 CPU/内存/重启次数，学习正常水位（均值±Nσ），
+  # 偏离超阈值即生成「预测性预警」——此时 Prometheus 告警规则通常还没触发。
+  anomaly:
+    enabled: true
+    interval-seconds: 60          # 采样周期
+    sigma: 3.0                    # 偏离多少个标准差算异常
+    consecutive-hits: 2           # 连续命中多少次才预警（过滤单点毛刺）
+    cooldown-minutes: 30          # 同一服务同一指标的预警冷却
+    window-samples: 60            # 滑动窗口保留的采样点数（60 点 × 60s = 1 小时基线）
+    min-samples: 12               # 冷启动保护：样本少于该数不判定
+    restart-delta-threshold: 3    # 重启次数单周期增量预警阈值
+    # 噪声地板（占均值的百分比）：标准差小于该比例时抬到地板值，避免"稳到标准差近 0"
+    # 的指标把正常抖动判成异常。内存设 2% —— 实测内存噪声 σ 仅占均值 0.01%~0.6%，
+    # 而真实故障（leaky-app 内存涨 208%）差三个数量级，2% 能干净切分。
+    # CPU 本身抖动比例就大（实测 12%~45%），地板必须设小，否则会压掉真实的 CPU 问题。
+    memory-noise-floor-percent: 2.0
+    cpu-noise-floor-percent: 0.5
+  # 前瞻性增强二：服务拓扑（影响面分析的数据层）。
+  topology:
+    # 拓扑缓存秒数。告警爆发时同一 namespace 被反复查询，缓存挡掉大部分 apiserver 调用。
+    cache-seconds: 60
+  # 前瞻性增强三：修复后回归验证。
+  # 「执行完」不等于「修好了」——成功后进入观察期，故障复现则改判 REGRESSED 并重新触发分析。
+  recovery:
+    enabled: true
+    observe-minutes: 5            # 观察期总时长
+    interval-seconds: 30          # 复查间隔
+    failure-threshold: 2          # 连续失败多少次判定复现
   webhook:
     # Alertmanager Webhook 自身认证令牌：请求必须携带 X-Webhook-Token，
     # 与 Alertmanager 的 http_config.headers 配置保持一致。留空表示不校验（仅本地调试用）。
@@ -85,6 +114,9 @@ opsagent:
     idempotency:
       ttlMinutes: 5
     fingerprint-keys: alertname,instance,severity
+    # 告警降噪：同一 Pod/服务的多条告警（alertname 不同）在窗口内只触发一次
+    # agent 分析，后续告警照常落库但聚合进已有分析任务。0 = 关闭。
+    correlation-window-minutes: 3
   log:
     # SSH 取日志失败时的本地降级目录，留空表示不降级
     local-dir: ""

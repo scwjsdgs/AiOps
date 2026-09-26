@@ -1,0 +1,47 @@
+Redis 持久化与数据丢失排查
+
+一、持久化模式
+1. RDB：定时快照，save 3600 1 300 100 等
+2. AOF：每次写操作追加，级别（always/everysec/no）
+3. AOF rewrite：后台压缩形成基线文件
+
+二、数据丢失常见场景
+1. AOF 关闭且 RDB 未触发
+   - 现象：容器重启数据全空
+   - 原因：写入量少不达阈值，save 条件未触发
+   - 处置：开启 AOF everysec + 定期 BGREWRITEAOF
+
+2. AOF 未落盘
+   - 现象：重启后部分数据丢失
+   - 原因：appendfsync no 或磁盘满
+   - 处置：改为 everysec，监控磁盘
+
+3. 容器卷未挂载
+   - 现象：/data 目录为空
+   - 原因：docker run 未挂载 volume 或挂载路径错误
+   - 处置：检查 volume 绑定，重启后验证 dump.rdb / appendonly.aof 是否存在
+
+三、验证方法
+1. 检查配置：
+   redis-cli CONFIG GET appendonly
+   redis-cli CONFIG GET appendfsync
+   redis-cli CONFIG GET save
+
+2. 手动触发快照：
+   redis-cli BGSAVE
+   redis-cli BGREWRITEAOF
+
+3. 重启验证：
+   docker restart redis
+   redis-cli --scan --pattern 'task:*' | wc -l
+
+四、最佳实践
+- 任务类数据建议同时开启 AOF + RDB，TTL 7 天
+- 关键键使用持久化标识 + 监控
+- 周期性备份：dump.rdb 拷贝出容器
+- 容器重启策略：unless-stopped，防止意外丢失
+
+五、监控指标
+- aof_delayed_fsync：AOF 同步延迟
+- rdb_last_bgsave_status：RDB 最后一次保存状态
+- keyspace_hits/misses：命中率

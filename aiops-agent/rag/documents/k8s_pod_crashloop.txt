@@ -1,0 +1,54 @@
+Kubernetes Pod CrashLoopBackOff 排查手册
+
+一、现象
+Pod 状态为 CrashLoopBackOff，反复重启，重启次数持续增加
+
+二、定位步骤
+1. 查看事件：kubectl describe pod <pod> -n <ns>
+2. 查看重启次数：kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[*].restartCount}'
+3. 查看日志：kubectl logs <pod> --previous  # 上一次失败容器的日志
+4. 查看事件时间线：kubectl get events -n <ns> --field-selector involvedObject.name=<pod>
+
+三、常见原因与处置
+1. OOMKilled（137 退出码）
+   - 现象：OOMKill，Memory usage 超过 limit
+   - 处置：kubectl top pod 查看内存，调整 resources.requests/limits，或优化应用内存泄漏
+   - 验证：扩容后重启，观察是否再次 OOM
+
+2. 应用启动失败
+   - 现象：启动脚本退出非 0
+   - 处置：查看 container 的 Command/Args，检查依赖服务是否就绪
+   - 典型：数据库未就绪时应用启动，加 initContainers 或探针
+   - 处置：调整 readinessProbe initialDelaySeconds / periodSeconds
+
+3. 配置错误
+   - ConfigMap/Secret 未挂载或值错误
+   - 处置：kubectl describe pod 检查挂载，kubectl get cm -o yaml 核对
+
+4. 镜像拉取失败
+   - 状态为 ErrImagePull / ImagePullBackOff
+   - 处置：检查 image 名称与 tag、镜像仓库权限、network policy
+
+5. 环境变量缺失
+   - 应用抛 NullPointer 或 FileNotFound
+   - 处置：kubectl describe pod 查看 env，补充后 rollout
+
+6. 存储挂载问题
+   - 无法挂载 PVC，导致启动阻塞
+   - 处置：kubectl get pvc，检查 PV 容量/权限，必要时重新绑定
+
+四、根因判断要点
+- restartCount 增长速度：快速增长（<1min）多为启动即失败
+- 上一次日志的退出码：137=OOM，1=应用错误，139=SIGSEGV
+- 事件中是否有 FailedMount、FailedScheduling
+
+五、修复验证
+1. 修改配置后 rollout restart deployment
+2. 观察 3-5 分钟，kubectl get pod 观察 Ready 状态
+3. 再次触发查询指标：kube_pod_container_status_restarts_total 是否不再增长
+4. 在报告中记录证据链：重启次数、日志片段、事件、修复动作、验证结果
+
+六、预防
+- 设置合理资源限制、探针参数
+- 镜像健康检查、日志完善
+- CI 中镜像启动 smoke test

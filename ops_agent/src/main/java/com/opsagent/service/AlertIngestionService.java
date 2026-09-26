@@ -31,6 +31,7 @@ public class AlertIngestionService {
     private final AgentCallbackService agentCallbackService;
     private final AlertRepository alertRepository;
     private final MeterRegistry meterRegistry;
+    private final ImpactAnalysisService impactAnalysisService;
 
     private Counter alertReceivedCounter;
     private Counter alertProcessedCounter;
@@ -72,7 +73,11 @@ public class AlertIngestionService {
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(saved -> {
                     String alertId = saved.getId();
-                    return taskScheduler.createTask("ROOT_CAUSE_ANALYSIS", alertId, alert.getDescription())
+                    // 触发分析前先把影响面算出来，拼进任务输入 ——
+                    // 让 LLM 一开始就知道「这影响了哪些流量入口、是否已断流」，
+                    // 而不必自己从零散日志里猜。查不到就退回原始描述，不阻塞建任务。
+                    String input = enrichWithImpact(alert.getDescription());
+                    return taskScheduler.createTask("ROOT_CAUSE_ANALYSIS", alertId, input)
                             .flatMap(task -> {
                                 // 这里是 fire-and-forget，绝不能等 agent 跑完。
                                 // ReAct 循环要几十秒到几分钟，而前端 axios 只等 10 秒，
@@ -80,7 +85,7 @@ public class AlertIngestionService {
                                 // 注意必须用 onComplete 回调标记 ANALYZING：notifyAgent
                                 // 返回 Mono<Void>，完成时不发任何元素，两参数 subscribe
                                 // 的 onNext 永远不会触发，告警会永远停在 PENDING。
-                                agentCallbackService.notifyAgent(task.getId(), alert.getDescription())
+                                agentCallbackService.notifyAgent(task.getId(), input)
                                         .subscribe(
                                                 null,
                                                 e -> markAlert(alertId, "FAILED", false),
@@ -89,6 +94,33 @@ public class AlertIngestionService {
                             });
                 })
                 .then();
+    }
+
+    /**
+     * 把影响面摘要追加到任务输入末尾。
+     *
+     * 失败（K8s 不可达、解析不出服务名）一律退回原始描述：影响面是增强信息，
+     * 拿不到时分析该怎么做还怎么做，绝不能因为它让告警处理失败。
+     */
+    private String enrichWithImpact(String description) {
+        try {
+            String service = impactAnalysisService.resolveServiceFromText(description);
+            if (service == null) {
+                return description;
+            }
+            Map<String, Object> impact = impactAnalysisService.analyze(service);
+            if (!Boolean.TRUE.equals(impact.get("available"))) {
+                return description;
+            }
+            Object summary = impact.get("summary");
+            if (summary == null || summary.toString().isBlank()) {
+                return description;
+            }
+            return description + "\n\n" + summary;
+        } catch (Exception e) {
+            log.warn("影响面注入失败（不影响分析）: {}", e.getMessage());
+            return description;
+        }
     }
 
     private void markAlert(String alertId, String status, boolean processed) {

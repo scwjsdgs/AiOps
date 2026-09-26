@@ -14,7 +14,8 @@ const routes = [
       { path: 'approvals', component: () => import('@/views/Approvals.vue') },
       { path: 'tasks', component: () => import('@/views/Task.vue') },
       { path: 'tools', component: () => import('@/views/Tool.vue') },
-      { path: 'realtime', component: () => import('@/views/RealTime.vue') }
+      { path: 'realtime', component: () => import('@/views/RealTime.vue') },
+      { path: 'chatops', component: () => import('@/views/ChatOps.vue') }
     ]
   }
 ]

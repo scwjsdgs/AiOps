@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 
 import httpx
@@ -94,6 +95,14 @@ class CallbackService:
                 resp.raise_for_status()
             except Exception as e:
                 print(f"完成回调失败: {e}")
+
+        # 自学习闭环：报告回传成功后，异步把它沉淀进案例库。
+        # 这是增强不是主链路——入库失败绝不影响回调本身，也不阻塞返回。
+        try:
+            from rag.case_store import save_case
+            await asyncio.to_thread(save_case, result, "", "", status)
+        except Exception as e:
+            print(f"案例入库失败（可忽略）: {e}")
 
 
 callback_service = CallbackService()

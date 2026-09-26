@@ -18,10 +18,30 @@ class Settings(BaseSettings):
     # 5 轮不够用，会中途撞上限。
     AGENT_MAX_ITERATIONS: int = int(os.getenv("AGENT_MAX_ITERATIONS", "8"))
 
+    # 单次分析中 query_metrics 的调用上限。LLM 会陷入「反复查指标佐证已有结论」的循环，
+    # 查出越来越细的 PromQL 却永远不下结论，导致修复步骤根本走不到、报告也产出不了。
+    # 到上限后在代码层直接拒绝执行并回注提示，逼它收敛——纯 Prompt 约束不可靠。
+    #
+    # 取值 5：一次完整排查通常要查「副本数 + 重启次数 + CPU + 内存 + 一条补充」，
+    # 5 次足够覆盖而不误伤。设 3 会打断 CPU/内存多维劣化类的正常分析。
+    AGENT_MAX_METRICS_QUERIES: int = int(os.getenv("AGENT_MAX_METRICS_QUERIES", "5"))
+
+    # 同一工具 + 同一参数的重复调用上限（集群状态未变化时）。
+    # 防止「换个写法再查一遍」式的原地打转。
+    AGENT_MAX_SAME_CALLS: int = int(os.getenv("AGENT_MAX_SAME_CALLS", "2"))
+
     # 向量库配置
     RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "true").lower() in ("1", "true", "yes", "on")
     VECTOR_STORE_DIR: str = os.getenv("VECTOR_STORE_DIR", "./rag/chroma_db")
     DOCUMENTS_DIR: str = os.getenv("DOCUMENTS_DIR", "./rag/documents")
+
+    # embedding 用阿里云百炼（DashScope）原生 text-embedding 接口，
+    # 与 LLM 走的 DeepSeek 是两条独立通道：embedding 只影响知识库建库/检索，
+    # 不影响对话模型。密钥从环境变量 DASHSCOPE_API_KEY 或 .env 读取。
+    # 字段名必须与 .env 键名一致，否则 pydantic-settings 会把 .env 里的键
+    # 当作多余字段报 extra_forbidden。DASHSCOPE_API_KEY 是密钥，别提交进 git。
+    DASHSCOPE_API_KEY: str = os.getenv("DASHSCOPE_API_KEY", "")
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "qwen3.7-text-embedding-flash")
 
     # Java 后端地址（ops_agent 监听 8081）
     JAVA_BASE_URL: str = os.getenv("JAVA_BASE_URL", "http://localhost:8081")
@@ -29,6 +49,12 @@ class Settings(BaseSettings):
     # 与 Java 约定的内部共享密钥。回调接口必须携带 X-Internal-Token，
     # 因为这些接口能触发 restart/scale 等真实运维操作，不能裸奔放行。
     JAVA_INTERNAL_TOKEN: str = os.getenv("JAVA_INTERNAL_TOKEN", "dev-internal-token")
+
+    # 主动巡检配置
+    # HEALTH_CHECK_ENABLED=false 关闭定时巡检；HEALTH_CHECK_INTERVAL_HOURS>0 时按该间隔周期性巡检，
+    # 否则维持默认「每天 8:00」整点巡检。
+    HEALTH_CHECK_ENABLED: bool = os.getenv("HEALTH_CHECK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    HEALTH_CHECK_INTERVAL_HOURS: float = float(os.getenv("HEALTH_CHECK_INTERVAL_HOURS", "-1"))
 
     # 调用 Java 的 HTTP 超时（秒）。read 必须足够长：
     # restart_service 在 Java 侧本身就要跑好几秒（缩容、等待、扩容）。

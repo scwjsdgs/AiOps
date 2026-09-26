@@ -33,17 +33,36 @@ public class WebSocketPushService {
     /** taskId -> 订阅该任务的所有连接。一个任务可能同时被多个页面订阅。 */
     private final Map<String, Set<Sinks.Many<String>>> sinks = new ConcurrentHashMap<>();
 
+    /**
+     * 全局订阅者：不绑定任何 taskId，用于接收审批这类"与具体任务无关、
+     * 所有页面都该知道"的事件。
+     *
+     * 审批必须广播：agent 发起审批时用户很可能停在仪表板或告警页，
+     * 只推给该任务的订阅者等于没推——没人会恰好在任务详情页等着。
+     */
+    private final Set<Sinks.Many<String>> broadcastSinks = ConcurrentHashMap.newKeySet();
+
+    /** 广播频道标识：前端连 /ws/agent（不带 taskId）即订阅全部广播事件。 */
+    public static final String BROADCAST_CHANNEL = "broadcast";
+
     private final Sinks.Many<AgentMessage> messageSink = Sinks.many().replay().latest();
     private final ObjectMapper objectMapper;
 
-    /** 注册一个连接，返回它专属的出站 sink。 */
+    /**
+     * 注册一个连接，返回它专属的出站 sink。
+     *
+     * 每个连接都同时加入广播集合：审批事件必须让所有人看到，
+     * 不管他当前停在哪个页面、订阅的是哪个 taskId。
+     */
     public Sinks.Many<String> register(String taskId) {
         Sinks.Many<String> sink = Sinks.many().unicast().onBackpressureBuffer();
         sinks.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).add(sink);
+        broadcastSinks.add(sink);
         return sink;
     }
 
     public void unregister(String taskId, Sinks.Many<String> sink) {
+        broadcastSinks.remove(sink);
         Set<Sinks.Many<String>> set = sinks.get(taskId);
         if (set == null) {
             return;
@@ -51,6 +70,35 @@ public class WebSocketPushService {
         set.remove(sink);
         if (set.isEmpty()) {
             sinks.remove(taskId, set);
+        }
+    }
+
+    /**
+     * 向所有连接广播一条消息（不区分 taskId）。
+     * 审批创建/决定都走这里——用户在任何页面都应立即收到。
+     */
+    public void broadcast(AgentMessage message) {
+        messageSink.tryEmitNext(message);
+
+        if (broadcastSinks.isEmpty()) {
+            // 没人订阅广播频道（例如只在任务详情页）：不是错误，事件仍写进了库和审计
+            log.debug("广播 {} 时无全局订阅者，跳过实时推送", message.getType());
+            return;
+        }
+
+        String json;
+        try {
+            json = objectMapper.writeValueAsString(message);
+        } catch (JsonProcessingException e) {
+            log.error("序列化广播消息失败 type={}", message.getType(), e);
+            return;
+        }
+
+        for (Sinks.Many<String> sink : broadcastSinks) {
+            Sinks.EmitResult result = sink.tryEmitNext(json);
+            if (result.isFailure()) {
+                log.warn("广播推送失败 type={} result={}", message.getType(), result);
+            }
         }
     }
 

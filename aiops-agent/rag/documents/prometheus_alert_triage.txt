@@ -1,0 +1,46 @@
+Prometheus 告警分级与初步判定手册
+
+一、告警分级
+critical：影响线上业务，需 15 分钟内响应
+warning：潜在风险，需 1 小时内响应
+info：信息类告警，记录不追踪
+
+二、常见告警类型
+1. KubePodCrashLooping
+   - 判断：increase(kube_pod_container_status_restarts_total[5m]) > 1
+   - 初步步骤：kubectl logs --previous 查看退出码，OOMKilled/启动失败
+   - 常见根因：内存泄漏 / 配置错误 / 依赖未就绪
+
+2. KubePodNotReady
+   - 判断：kube_pod_status_ready==0 持续 5 分钟
+   - 初步步骤：kubectl describe pod 查看事件， readinessProbe 失败
+   - 常见根因：应用未就绪 / 资源不足 / volume 挂载失败
+
+3. ReplicasMismatch
+   - 判断：kube_deployment_status_replicas != kube_deployment_spec_replicas
+   - 初步步骤：kubectl get deployment，kubectl get rs，查看 Pod 状态
+   - 常见根因：CrashLoop、调度受限、亲和性冲突
+
+4. KubePodContainerStatusWait
+   - 容器进入 Waiting 状态
+   - 常见根因：ImagePullBackOff / ErrImagePull / CrashLoop
+
+5. NodeNotReady
+   - 节点 kube_node_status_condition 未就绪
+   - 初步步骤：kubectl describe node，查看 kubelet 日志
+   - 常见根因：网络故障、磁盘满、kubelet 崩溃
+
+三、告警聚类
+同一 Deployment 的多个 Pod 同时告警 -> 可能是镜像问题、ConfigMap 变更、依赖崩
+同一命名空间多条告警 -> 可能是网络策略变更、节点故障
+
+四、降噪原则
+- 时间窗口内相同 namespace + deployment 的多条告警合并为一个分析任务
+- 从 firing 到 resolved 全流程记录，避免重复触发
+
+五、响应模板
+1. 确认影响面：受影响服务、Pod 数量、是否用户可观测
+2. 快速止血：扩容、回滚、重启（需审批）
+3. 根因定位：日志 + 事件 + 指标三源交叉
+4. 修复验证：指标回稳、业务埋点正常
+5. 沉淀：写进案例库，形成 SOP

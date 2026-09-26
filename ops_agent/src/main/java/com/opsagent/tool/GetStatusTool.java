@@ -28,7 +28,9 @@ public class GetStatusTool extends KubernetesToolBase implements Tool {
 
     @Override
     public String getDescription() {
-        return "获取 Deployment 的运行状态：副本数、就绪副本数、镜像、状态条件。";
+        return "获取 Deployment 的运行状态：副本数、就绪副本数、镜像、状态条件。"
+                + "若 Deployment 不存在，会返回 status=not_found（这是一个事实，不是执行失败），"
+                + "据此可判断「该服务根本没有部署」，不必改用其他工具重试。";
     }
 
     @Override

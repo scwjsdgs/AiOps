@@ -3,8 +3,6 @@ package com.opsagent.service;
 import com.opsagent.entity.User;
 import com.opsagent.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Autowired;
-
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 

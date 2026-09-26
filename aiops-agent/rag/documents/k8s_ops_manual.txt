@@ -1,0 +1,80 @@
+# Kubernetes 生产运维手册
+
+本手册覆盖 K8s 环境的常见故障排查与恢复步骤,供智能运维 Agent 在告警分析时检索参考。
+
+## 1. Pod 反复崩溃重启 (CrashLoopBackOff)
+
+定位步骤:
+1. 查看 Pod 状态与重启次数: `kubectl describe pod <name> -n <namespace>`
+2. 查看上次退出码与原因: `kubectl get pod -o yaml` 中 `lastState.terminated.reason/exitCode`
+3. 查看当前日志: `kubectl logs <pod> -n <namespace> --previous`
+4. 常见根因:
+   - 应用启动即抛异常(依赖未就绪、配置缺失)
+   - 探针(liveness/readiness)配置过严,误判失败导致被杀
+   - 内存/CPU 超出 request 被 OOMKilled,退出码 137
+5. 处置:
+   - 若探针过严 → 调整 initialDelaySeconds / failureThreshold 后重试
+   - 若 OOMKilled(exit 137) → 提升内存 limit 或优化 JVM -Xmx
+   - 若启动依赖未就绪 → 添加 initContainer 或重启依赖服务
+
+退出码参考: 137=OOM 被杀; 1=应用自身异常; 124=超时被杀。
+
+## 2. 镜像拉取失败 (ImagePullBackOff / ErrImagePull)
+
+定位步骤:
+1. `kubectl describe pod` 查看 events 里拉取失败的具体原因
+2. 常见根因与处置:
+   - 镜像 Tag 不存在 → 核对镜像版本是否已推送
+   - 私有仓库未配置 PullSecret → 创建 Secret 并引用到 Pod
+     `kubectl create secret docker-registry ...`
+   - 仓库认证过期 → 更新 PullSecret 的凭据后重建 Pod
+   - 网络无法访问仓库 → 检查出口网络 / 镜像仓库地址
+
+## 3. Pod 一直 Pending / 无法调度
+
+定位步骤:
+1. `kubectl describe pod` 看 Events 里的调度失败原因
+2. 常见根因:
+   - 节点资源不足(CPU/内存) → `kubectl top node` 查看
+   - 亲和性/污点不满足 → 检查 nodeSelector / tolerations
+   - PVC 无法挂载(StorageClass 不存在或 pv 未绑定)
+3. 处置: 扩容节点、调整调度约束,或修复 PVC 绑定。
+
+## 4. 服务探针就绪失败 (ReadinessProbe 持续失败, 流量异常)
+
+定位:
+1. `kubectl get pod` 观察 Pod 是否 Ready
+2. 看 readiness 探针探测哪个端口/路径失败
+3. 常见根因: 应用实际监听端口与 probe 不一致、启动慢未达探针时间窗
+处置: 修正 probe 端口/path,或增大 initialDelaySec延迟。
+
+## 5. 服务无法访问 / Connection refused
+
+定位:
+1. `kubectl get svc`、`kubectl get endpoints` 确认 Service 后端是否有可用 endpoint
+2. 无 endpoint → 对应 Pod 的标签 selector 与 Service 不匹配
+3. 有 endpoint 但连接失败 → 检查容器内监听地址(应 0.0.0.0 而非 127.0.0.1)
+4. DNS 解析失败 → 检查 CoreDNS 状态与 Service 名称/命名空间
+
+处置: 修正 selector、监听地址,或重启 CoreDNS。
+
+## 6. HPA 扩缩容异常 / 容量不足
+
+定位:
+1. `kubectl get hpa`、`kubectl describe hpa` 看当前/目标副本数及原因
+2. CPU 指标超阈值未扩 → 检查 metrics-server 是否就绪、target 是否配置正确
+3. 手动无法扩容 → 检查资源 quota 与节点容量
+
+处置: 修复 metrics-server、调整 HPA 阈值,或手动 kubectl scale。
+
+## 7. 数据库连接池打满
+
+定位:
+1. 检查连接池占用率与等待线程: jstack / jmx
+2. 慢查询堆积占用连接: 查看慢 SQL 日志
+3. 处置: 定位并优化慢查询 → 增大连接池上限 → 必要时重启服务回收连接
+
+## 8. ConfigMap / Secret 变更未生效
+
+说明: 已挂载的 ConfigMap/Secret 更新后,默认不会实时重载进已运行的 Pod。
+处置: 更新配置后需要滚动重建 Pod(`kubectl rollout restart`)使新配置生效。

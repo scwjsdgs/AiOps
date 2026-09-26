@@ -28,6 +28,7 @@ public class AgentCallbackService {
     private final WebSocketPushService webSocketPushService;
     private final AlertRepository alertRepository;
     private final WebClient webClient;
+    private final RecoveryVerificationService recoveryVerificationService;
 
     @Value("${opsagent.agent.url:http://localhost:5000}")
     private String agentBaseUrl;
@@ -113,7 +114,27 @@ public class AgentCallbackService {
                 // 告警永远停在 ANALYZING，列表里所有告警看起来"永远在分析中"，
                 // Dashboard 的"已处理"统计也对不上。
                 .then(markRelatedAlert(taskId, status))
+                // 前瞻性增强：修复类任务成功收尾后进入回归观察期——「执行完」不等于
+                // 「修好了」，观察期内若故障复现将任务改判 REGRESSED 并重新触发分析。
+                // 这里只是登记观察（内部异步，立即返回），不阻塞回调本身。
+                .doOnSuccess(v -> scheduleRecoveryVerification(taskId, status))
                 .then();
+    }
+
+    /**
+     * 只对「成功收尾的根因分析任务」安排回归验证：失败任务没有可验证的修复动作，
+     * 巡检/报告类任务也没有明确的服务对象。
+     */
+    private void scheduleRecoveryVerification(String taskId, String status) {
+        if (!"SUCCESS".equals(status)) {
+            return;
+        }
+        try {
+            recoveryVerificationService.scheduleVerification(taskId);
+        } catch (Exception e) {
+            // 回归验证是增强能力，绝不能因为它让任务完成回调失败
+            log.warn("登记回归验证失败 taskId={}: {}", taskId, e.getMessage());
+        }
     }
 
     /**

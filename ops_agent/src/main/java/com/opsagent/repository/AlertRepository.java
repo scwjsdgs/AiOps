@@ -1,6 +1,8 @@
 package com.opsagent.repository;
 
 import com.opsagent.entity.AlertEntity;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -40,4 +42,23 @@ public interface AlertRepository extends JpaRepository<AlertEntity, String> {
      * 取最新一条：同一告警可能多次 firing，最新的才是当前活跃记录。
      */
     List<AlertEntity> findByFingerprintOrderByCreateTimeDesc(String fingerprint);
+
+    /**
+     * 带筛选的分页查询。前端告警页的搜索框/筛选器必须打到后端：
+     * 只在前端过滤当前页数据的话，搜索"nginx"只能命中这 10 条里的，
+     * 用户以为搜了全库，实际是假搜索——所以筛选条件全部下推到 SQL。
+     *
+     * 各条件为 null（或空串）时该条件不生效，一个方法覆盖所有组合：
+     *   severity 级别、status 状态、keyword 标题/服务名/描述模糊匹配。
+     */
+    @Query("select a from AlertEntity a where " +
+            "(:severity is null or a.severity = :severity) and " +
+            "(:status is null or a.status = :status) and " +
+            "(:keyword is null or lower(a.title) like lower(concat('%', :keyword, '%')) " +
+            "  or lower(a.serviceName) like lower(concat('%', :keyword, '%')) " +
+            "  or lower(a.description) like lower(concat('%', :keyword, '%')))")
+    Page<AlertEntity> search(@Param("severity") String severity,
+                             @Param("status") String status,
+                             @Param("keyword") String keyword,
+                             Pageable pageable);
 }

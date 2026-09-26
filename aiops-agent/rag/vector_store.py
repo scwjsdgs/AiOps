@@ -4,7 +4,7 @@ import logging
 
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
+from rag.dashscope_embeddings import DashScopeEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from config import config
 
@@ -28,10 +28,10 @@ def _count_documents(store) -> int:
 
 
 def build_vector_store(force_rebuild: bool = False):
-    embeddings = OpenAIEmbeddings(
-        openai_api_key=config.LLM_API_KEY,
-        openai_api_base=config.LLM_BASE_URL,
-    )
+    # embedding 走 DashScope 原生接口（见 rag/dashscope_embeddings.py），
+    # 不再复用 LLM 的 DeepSeek key —— DeepSeek 没有 /embeddings，之前打开 RAG
+    # 会在启动时反复 404。两条通道独立：LLM 管对话，embedding 只管知识库。
+    embeddings = DashScopeEmbeddings()
     persist_dir = config.VECTOR_STORE_DIR
     if not force_rebuild and os.path.exists(persist_dir) and os.listdir(persist_dir):
         store = Chroma(

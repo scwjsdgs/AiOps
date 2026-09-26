@@ -7,48 +7,47 @@ on:
     branches: [main]
 
 jobs:
-  # 如果以后 Java 代码写完了，把这里的注释打开
-  # java-build:
-  #   name: Java Build & Test
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-java@v4
-  #       with:
-  #         java-version: '21'
-  #         distribution: 'temurin'
-  #     - run: cd ops_agent && mvn -B clean test
-
-  # 如果以后 Python 代码写完了，把这里的注释打开
-  # python-test:
-  #   name: Python Test
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: '3.12'
-  #     - run: cd aiops-agent && pip install -r requirements.txt && pytest
-
-  # 如果以后前端代码写完了，把这里的注释打开
-  # frontend-build:
-  #   name: Frontend Build
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-node@v4
-  #       with:
-  #         node-version: '20'
-  #     - run: cd ops-agent-front && npm install && npm run build
-
-  # 当前仅验证仓库基础结构（保证 CI 能跑通）
-  project-init-check:
-    name: Project Initialization Check
+  # -------- Java：构建 + 单元测试 --------
+  java-build:
+    name: Java Build & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check project structure
-        run: |
-          echo "✅ 仓库结构检查通过"
-          echo "当前包含模块："
-          ls -d */ 
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - name: Compile
+        run: cd ops_agent && mvn -B -q compile -DskipTests
+      # 纯单元测试，不依赖 K8s/MySQL/Redis。@SpringBootTest 的 contextLoads 需要
+      # 外部基础设施，只在本地起全套环境时跑，不进 CI。
+      - name: Unit tests (参数防呆)
+        run: cd ops_agent && mvn -B test -Dtest=ScaleUpToolTest,RollbackToolTest
+
+  # -------- Python：单测 + 评测自测 --------
+  python-test:
+    name: Python Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: cd aiops-agent && pip install -r requirements.txt pytest pytest-asyncio
+      - name: Run unit tests
+        run: cd aiops-agent && python -m pytest services/test_task_runner.py -q
+      - name: Eval script self-test (打分函数能抓违规)
+        run: cd aiops-agent && python evaluate_agent.py --self-test
+
+  # -------- 前端：构建 --------
+  frontend-build:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install & build
+        run: cd ops-agent-front && npm install && npm run build

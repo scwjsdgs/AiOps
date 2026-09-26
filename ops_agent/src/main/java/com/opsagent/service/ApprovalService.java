@@ -3,7 +3,6 @@ package com.opsagent.service;
 import com.opsagent.entity.Approval;
 import com.opsagent.exception.BusinessException;
 import com.opsagent.repository.ApprovalRepository;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -37,9 +36,24 @@ public class ApprovalService {
 
     private final StringRedisTemplate redisTemplate;
     private final ApprovalRepository approvalRepository;
+    private final WebSocketPushService webSocketPushService;
 
     private static final String PREFIX = "approval:";
-    private static final long WAIT_TIMEOUT_MS = 55_000; // 55 秒超时
+
+    /**
+     * 等待人工决定的超时（毫秒）。从配置读取，默认 55 秒。
+     *
+     * 原本硬编码 55_000，与 HumanApprovalTool 的 opsagent.approval.wait-timeout
+     * 各管各的——改了配置只影响提示语，实际等待时长纹丝不动，是个隐蔽的坑。
+     * 注意上限：必须小于 Python 侧 HTTP_READ_TIMEOUT（默认 60s），
+     * 否则审批还没结束，Python 先超时了。
+     */
+    @org.springframework.beans.factory.annotation.Value("${opsagent.approval.wait-timeout:55}")
+    private long waitTimeoutSeconds;
+
+    private long waitTimeoutMs() {
+        return waitTimeoutSeconds * 1000;
+    }
 
     /** 仅用于内部决策返回。record 的访问器是 approved()/mode()/note()，与调用端 HumanApprovalTool 的写法一致。 */
     public record Decision(boolean approved, String mode, String note) {
@@ -98,6 +112,13 @@ public class ApprovalService {
         redisMap.put("createdAt", LocalDateTime.now().toString());
         redisTemplate.opsForHash().putAll(PREFIX + requestId, redisMap);
 
+        // 3. 通过 WebSocket 广播"有审批待处理"。
+        // 改造前这里只写了 Redis/MySQL 就进入阻塞等待——前端完全不知道有审批在等，
+        // 55 秒后被系统判超时拒绝。整个 manual 模式因此形同虚设。
+        // 审批事件与任务事件共用同一条 WS 通道（/ws/agent），前端按 type 区分。
+        pushApprovalEvent("APPROVAL_PENDING", requestId, operation, reason, taskId,
+                "待审批：" + operation + "（" + waitTimeoutSeconds + " 秒内未处理将自动拒绝）");
+
         long start = System.currentTimeMillis();
         while (true) {
             Object statusObj = redisTemplate.opsForHash().get(PREFIX + requestId, "status");
@@ -119,7 +140,7 @@ public class ApprovalService {
                 return new Decision(approved, mode, note);
             }
 
-            if (System.currentTimeMillis() - start > WAIT_TIMEOUT_MS) {
+            if (System.currentTimeMillis() - start > waitTimeoutMs()) {
                 // 超时处理
                 redisTemplate.opsForHash().put(PREFIX + requestId, "status", "TIMEOUT");
                 redisTemplate.opsForHash().put(PREFIX + requestId, "note", "Waiting approval timed out");
@@ -129,6 +150,10 @@ public class ApprovalService {
                 a.setDecisionNote("Waiting approval timed out");
                 a.setDecidedAt(LocalDateTime.now());
                 approvalRepository.save(a);
+                // 超时也要广播：前端弹窗需要自动关闭，否则用户会对着一个
+                // 早已失效的审批框点"批准"，拿到"已处理，不允许重复审批"的报错。
+                pushApprovalEvent("APPROVAL_TIMEOUT", requestId, operation, reason, taskId,
+                        "审批超时：" + operation + "（" + waitTimeoutSeconds + " 秒内无人处理，已自动拒绝）");
                 return new Decision(false, "timeout", "Waiting approval timed out");
             }
 
@@ -177,7 +202,38 @@ public class ApprovalService {
         }
         redisTemplate.opsForHash().putAll(PREFIX + requestId, update);
 
+        // 广播决定结果：其它打开着的页面要把弹窗关掉，列表也要刷新状态
+        pushApprovalEvent("APPROVAL_DECIDED", requestId, approval.getOperation(),
+                approval.getReason(), approval.getTaskId(),
+                "APPROVAL_DECIDED:" + requestId + ":" + status);
+
         log.info("审批单 {} 已由 {} {}: {}", requestId, decidedBy, status, note);
         return new Decision(approved, status.toLowerCase(), note);
+    }
+
+    /**
+     * 广播审批事件到所有 WebSocket 连接。
+     *
+     * AgentMessage 的字段被复用：type 传事件类型，stepName 存操作名，
+     * content 存人类可读描述，taskId 保留原始任务关联。
+     */
+    private void pushApprovalEvent(String type, String requestId, String operation,
+                                   String reason, String taskId, String content) {
+        try {
+            com.opsagent.model.AgentMessage msg = new com.opsagent.model.AgentMessage();
+            msg.setType(type);
+            msg.setTaskId(taskId == null ? "" : taskId);
+            msg.setStepName("request_human_approval");
+            // requestId 必须带上：前端要靠它调审批接口，没有它弹窗点不动
+            msg.setContent(content + "|requestId=" + requestId
+                    + "|operation=" + operation
+                    + "|reason=" + (reason == null ? "" : reason)
+                    + "|timeout=" + waitTimeoutSeconds);
+            msg.setTimestamp(LocalDateTime.now());
+            webSocketPushService.broadcast(msg);
+        } catch (Exception e) {
+            // 推送失败不该影响审批主流程：记录仍在库中，用户可去审批页处理
+            log.warn("审批事件推送失败 requestId={} type={}", requestId, type, e);
+        }
     }
 }

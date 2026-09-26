@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from models import Alert
+from config import config
 from agents.react_agent import run_agent_for_alert, run_react_loop
 from services.callback import callback_service
 from services.task_runner import submit
@@ -200,15 +201,25 @@ def _build_health_check_alert(task_id: str, description: str) -> Alert:
 
 async def scheduled_health_check():
     """
-    后台定时巡检任务：每天凌晨 8:00 自动执行全服务健康检查。
+    后台定时巡检任务。
+
+    间隔策略：
+    - HEALTH_CHECK_ENABLED=false 时不启动（调用方判断）。
+    - HEALTH_CHECK_INTERVAL_HOURS > 0：按该间隔周期性巡检（如 1 小时一次，便于演示/高密场景）。
+    - 否则维持默认：每天 8:00 整点巡检一次。
     """
+    interval_hours = config.HEALTH_CHECK_INTERVAL_HOURS
     while True:
         now = datetime.datetime.now()
-        target = now.replace(hour=8, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += datetime.timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        logger.info(f"距离下次巡检还有 {wait_seconds / 3600:.2f} 小时")
+        if interval_hours > 0:
+            wait_seconds = interval_hours * 3600
+            logger.info(f"周期性巡检：间隔 {interval_hours} 小时一次")
+        else:
+            target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += datetime.timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            logger.info(f"距离下次巡检还有 {wait_seconds / 3600:.2f} 小时")
         await asyncio.sleep(wait_seconds)
 
         task_id = f"health_check_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -216,7 +227,8 @@ async def scheduled_health_check():
         try:
             alert = _build_health_check_alert(
                 task_id,
-                "全服务健康检查（主动巡检）：请检查所有核心服务的状态、日志、资源使用情况，并给出综合报告。",
+                "全服务健康检查（主动巡检）：请依次检查各核心服务的状态、就绪副本数、异常 Pod 事件与资源使用情况，"
+                "对异常服务给出根因推断和修复建议，一切高危修复动作（回滚/大比例扩缩容）必须先申请人工审批。",
             )
             submit(task_id, lambda: run_agent_for_alert(task_id, alert))
         except Exception as e:
@@ -226,8 +238,14 @@ async def scheduled_health_check():
 @app.on_event("startup")
 async def startup_event():
     """服务启动时，启动后台巡检任务，并预热向量库"""
-    asyncio.create_task(scheduled_health_check())
-    logger.info("主动巡检后台任务已启动，将在每天 8:00 执行。")
+    if config.HEALTH_CHECK_ENABLED:
+        asyncio.create_task(scheduled_health_check())
+        interval = config.HEALTH_CHECK_INTERVAL_HOURS
+        logger.info(
+            f"主动巡检后台任务已启动，{'每 ' + str(interval) + ' 小时一次' if interval > 0 else '每天 8:00'} 执行。"
+        )
+    else:
+        logger.info("主动巡检已通过 HEALTH_CHECK_ENABLED=false 关闭。")
     # 预热向量库：放到线程里跑，不阻塞启动；失败只记日志（get_vector_store 内部已兜底）
     asyncio.create_task(asyncio.to_thread(get_vector_store))
 

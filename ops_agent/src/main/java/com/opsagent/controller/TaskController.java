@@ -4,6 +4,8 @@ import com.opsagent.dto.ApiResponse;
 import com.opsagent.model.Task;
 import com.opsagent.service.TaskSchedulerService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Mono;
 
@@ -18,11 +20,18 @@ public class TaskController {
 
     private final TaskSchedulerService taskScheduler;
 
+    /**
+     * 任务详情。
+     *
+     * 任务不存在时返回**真实的 HTTP 404**（body 仍保留 code=404）。
+     * 之前是 HTTP 200 + body code=404，脚本靠 HTTP 状态码判断会误以为查到了。
+     */
     @GetMapping("/{id}")
-    public Mono<ApiResponse<Task>> getTask(@PathVariable String id) {
+    public Mono<ResponseEntity<ApiResponse<Task>>> getTask(@PathVariable String id) {
         return taskScheduler.getTask(id)
-                .map(ApiResponse::<Task>success)
-                .switchIfEmpty(Mono.just(ApiResponse.<Task>error(404, "Task not found")));
+                .map(t -> ResponseEntity.ok(ApiResponse.success(t)))
+                .switchIfEmpty(Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND)
+                        .body(ApiResponse.<Task>error(404, "Task not found"))));
     }
 
     /**
@@ -36,10 +45,14 @@ public class TaskController {
     @GetMapping
     public Mono<ApiResponse<Map<String, Object>>> listTasks(
             @RequestParam(required = false) String alertId,
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false) String keyword,
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "10") int size) {
-        return Mono.zip(taskScheduler.listTasks(alertId, page, size),
-                        taskScheduler.countTasks(alertId))
+        // list 与 count 必须传同一组过滤条件：过滤条件不一致会让分页 total
+        // 与实际结果数对不上（搜出 3 条却显示"共 100 条"）。
+        return Mono.zip(taskScheduler.listTasks(alertId, status, keyword, page, size),
+                        taskScheduler.countTasks(alertId, status, keyword))
                 .map(tuple -> {
                     Map<String, Object> data = new LinkedHashMap<>();
                     data.put("records", tuple.getT1());

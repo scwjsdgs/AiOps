@@ -1,0 +1,2 @@
+kubectl scale deploy leaky-app -n default --replicas=2
+kubectl get pods -n default

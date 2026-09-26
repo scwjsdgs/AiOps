@@ -10,7 +10,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 
 /**
  * Alertmanager Webhook 接收端点。
@@ -38,12 +37,37 @@ public class AlertWebhookController {
     @RateLimiter(name = "webhook")
     public Mono<ResponseEntity<Void>> receiveWebhook(
             @RequestHeader(value = "X-Webhook-Token", required = false) String token,
+            @RequestHeader(value = "Authorization", required = false) String authHeader,
             @RequestHeader(value = "X-Signature", required = false) String signature,
             @RequestBody AlertmanagerWebhookPayload payload) {
 
-        // 1) Token 校验：webhook 自身认证，与 JWT 放行并存。token 未配置视为仅本地调试。
+        // 1) Token 校验：支持两种方式
+        //   a) X-Webhook-Token 头（原设计）
+        //   b) Basic Auth 头，格式 "Basic <base64(user:password)>"，用户固定为 webhook，
+        //      密码即 webhookToken。这是为 Alertmanager（AlertmanagerConfig 不支持自定义
+        //      header，但支持 basicAuth）打通自动转发而加的。
         if (webhookToken != null && !webhookToken.isBlank()) {
-            if (token == null || !webhookToken.equals(token)) {
+            boolean authenticated = false;
+            // a) header token
+            if (token != null && !token.isBlank() && webhookToken.equals(token)) {
+                authenticated = true;
+            } else {
+                // b) basic auth
+                if (authHeader != null && authHeader.startsWith("Basic ")) {
+                    String base64 = authHeader.substring(6).trim();
+                    try {
+                        String decoded = new String(java.util.Base64.getDecoder().decode(base64));
+                        int idx = decoded.indexOf(':');
+                        if (idx > 0 && "webhook".equals(decoded.substring(0, idx))
+                                && webhookToken.equals(decoded.substring(idx + 1))) {
+                            authenticated = true;
+                        }
+                    } catch (IllegalArgumentException e) {
+                        log.debug("Basic auth base64 解码失败", e);
+                    }
+                }
+            }
+            if (!authenticated) {
                 log.warn("Webhook token 校验失败");
                 return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).build());
             }

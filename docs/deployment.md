@@ -52,7 +52,9 @@ K8s 操作通过 fabric8 客户端执行，namespace 默认为 `default`，可�
 | `LLM_BASE_URL` | LLM 接口地址（OpenAI 兼容） |
 | `LLM_MODEL` | 模型名（如 deepseek-v4-flash / qwen-plus） |
 | `JAVA_INTERNAL_TOKEN` | 内部通信令牌（调 Java 回调接口时携带） |
-| `RAG_ENABLED` | 是否启用知识库检索 |
+| `RAG_ENABLED` | 是否启用知识库检索（true 启用 RAG） |
+| `DASHSCOPE_API_KEY` | RAG embedding 专用密钥（阿里云百炼 DashScope 原生接口，与 LLM 无关；DeepSeek 无 `/v1/embeddings`） |
+| `EMBEDDING_MODEL` | embedding 模型名（如 qwen3.7-text-embedding-flash） |
 | `AGENT_MAX_ITERATIONS` | ReAct 推理最大轮数（默认 8） |
 | `AGENT_TIMEOUT_SECONDS` | 单任务整体超时（默认 300） |
 

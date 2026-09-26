@@ -6,6 +6,8 @@ import com.opsagent.service.ApprovalService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
@@ -45,11 +47,12 @@ public class ApprovalController {
     }
 
     @PostMapping("/{requestId}/decision")
-    public Mono<ApiResponse<Object>> decide(@PathVariable String requestId,
-                                            @RequestBody DecisionRequest body,
-                                            ServerWebExchange exchange) {
+    public Mono<ResponseEntity<ApiResponse<Object>>> decide(@PathVariable String requestId,
+                                                            @RequestBody DecisionRequest body,
+                                                            ServerWebExchange exchange) {
         if (body.getApproved() == null) {
-            return Mono.just(ApiResponse.error(400, "缺少 approved 字段"));
+            return Mono.just(ResponseEntity.badRequest()
+                    .body(ApiResponse.error(400, "缺少 approved 字段")));
         }
         // decidedBy 从 JWT filter 塞的 attribute 里取（JwtAuthenticationFilter 写入 "username"）
         String decidedBy = exchange.getAttributes().getOrDefault("username", "unknown").toString();
@@ -60,14 +63,19 @@ public class ApprovalController {
                     data.put("approved", d.approved());
                     data.put("mode", d.mode());
                     data.put("note", d.note());
-                    return ApiResponse.success((Object) data);
+                    return ResponseEntity.ok(ApiResponse.success((Object) data));
                 })
                 // decide 里要写 MySQL + Redis，都是阻塞 IO
                 .subscribeOn(Schedulers.boundedElastic())
                 .onErrorResume(e -> {
-                    // BusinessException（单号不存在/重复审批）返回 400，其余 500
-                    int code = e instanceof com.opsagent.exception.BusinessException ? 400 : 500;
-                    return Mono.just(ApiResponse.error(code, e.getMessage()));
+                    // BusinessException（单号不存在/重复审批）返回 400，其余 500。
+                    // HTTP 状态码同步映射，body 里仍保留 code，前端读 res.code 不受影响。
+                    boolean business = e instanceof com.opsagent.exception.BusinessException;
+                    int code = business ? 400 : 500;
+                    HttpStatus status = business ? HttpStatus.BAD_REQUEST
+                            : HttpStatus.INTERNAL_SERVER_ERROR;
+                    return Mono.just(ResponseEntity.status(status)
+                            .body(ApiResponse.error(code, e.getMessage())));
                 });
     }
 

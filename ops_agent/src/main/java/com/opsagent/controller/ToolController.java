@@ -17,10 +17,22 @@ public class ToolController {
 
     private final ToolRegistryService toolRegistry;
 
+    /**
+     * 工具清单。每项含 name / description / agentExposed / dangerous / idempotent，
+     * 这几个标记全部由后端权威计算，前端不硬编码 —— 改 application.yml 的白名单后
+     * 前端刷新即生效，不会出现两边不一致。
+     */
     @GetMapping("/list")
     public ApiResponse<?> listTools() {
-        // 返回工具名称和描述列表
         return ApiResponse.success(toolRegistry.getAllToolsInfo());
+    }
+
+    /**
+     * 当前生效的 agent 白名单，供前端展示与排查"为什么 agent 说某工具不存在"。
+     */
+    @GetMapping("/agent-exposed")
+    public ApiResponse<?> agentExposed() {
+        return ApiResponse.success(toolRegistry.getAgentExposedNames());
     }
 
     @PostMapping("/execute")

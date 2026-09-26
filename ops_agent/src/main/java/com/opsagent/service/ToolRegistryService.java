@@ -35,6 +35,7 @@ public class ToolRegistryService {
     private final HumanApprovalTool humanApprovalTool;
     private final QueryMetricsTool queryMetricsTool;
     private final PodEventsTool podEventsTool;
+    private final QueryImpactTool queryImpactTool;
 
     private final MeterRegistry meterRegistry;
 
@@ -61,6 +62,7 @@ public class ToolRegistryService {
         registerTool(humanApprovalTool);
         registerTool(queryMetricsTool);
         registerTool(podEventsTool);
+        registerTool(queryImpactTool);
 
         agentExposed = Arrays.stream(agentExposedConfig.split(","))
                 .map(String::trim)
@@ -139,10 +141,27 @@ public class ToolRegistryService {
         return new ToolExecutionResult(false, message, new LinkedHashMap<String, Object>(), 0);
     }
 
-    /** 全部工具，包含 generic_command —— /api/tools/list 用它，前端工具页需要看到完整清单。 */
-    public List<Map<String, String>> getAllToolsInfo() {
+    /**
+     * 全部工具，包含 generic_command —— /api/tools/list 用它，前端工具页需要看到完整清单。
+     *
+     * agentExposed / dangerous 由后端权威声明，不经前端硬编码：
+     *   agentExposed —— 是否在 opsagent.tools.agent-exposed 白名单内（决定 AI 能否自主调用）
+     *   dangerous    —— Tool.isDangerous()，会改变线上状态、需要审批边界
+     *   idempotent   —— Tool.isIdempotent()，失败可否安全重试
+     * 前端只负责渲染。白名单调整（改 application.yml）后前端立即生效，
+     * 不会出现"后端已放开、前端还标着仅人工执行"的漂移。
+     */
+    public List<Map<String, Object>> getAllToolsInfo() {
         return tools.values().stream()
-                .map(t -> Map.of("name", t.getName(), "description", t.getDescription()))
+                .map(t -> {
+                    Map<String, Object> info = new LinkedHashMap<>();
+                    info.put("name", t.getName());
+                    info.put("description", t.getDescription());
+                    info.put("agentExposed", agentExposed.contains(t.getName()));
+                    info.put("dangerous", t.isDangerous());
+                    info.put("idempotent", t.isIdempotent());
+                    return info;
+                })
                 .collect(Collectors.toList());
     }
 
