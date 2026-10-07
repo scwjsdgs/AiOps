@@ -1,0 +1,152 @@
+[
+  {
+    "question": "Nginx 炸了咋整，一直重启",
+    "standard_doc_id": "k8s_ops_manual.txt#CrashLoopBackOff",
+    "standard_answer": "查看 Pod 状态与重启次数、上次退出码、日志；定位探针过严/OOMKilled/依赖未就绪，调整探针或提升内存 limit。"
+  },
+  {
+    "question": "容器反复 CrashLoopBackOff 怎么排查",
+    "standard_doc_id": "k8s_pod_crashloop.txt#CrashLoopBackOff",
+    "standard_answer": "查 Pod 事件、重启次数、日志；常见 OOMKilled、应用启动失败、配置错误、镜像拉取失败、存储挂载。"
+  },
+  {
+    "question": "Pod 退出码 137 是什么原因",
+    "standard_doc_id": "k8s_ops_manual.txt#137",
+    "standard_answer": "137 表示 OOM 被杀，内存超过 limit，应提升内存 limit 或优化 JVM -Xmx。"
+  },
+  {
+    "question": "OOMKilled 内存泄漏怎么定位",
+    "standard_doc_id": "k8s_pod_crashloop.txt#OOMKilled",
+    "standard_answer": "kubectl top pod 查看内存，调整 resources.requests/limits，优化应用内存泄漏。"
+  },
+  {
+    "question": "镜像拉不出来 ImagePullBackOff 咋整",
+    "standard_doc_id": "k8s_ops_manual.txt#ImagePullBackOff",
+    "standard_answer": "kubectl describe pod 查看拉取失败原因；核对镜像 tag、配置 PullSecret、更新仓库凭据。"
+  },
+  {
+    "question": "K8s 探针配得太严格把 Pod 杀了怎么办",
+    "standard_doc_id": "k8s_ops_manual.txt#探针",
+    "standard_answer": "调整 liveness/readiness 的 initialDelaySeconds / failureThreshold，重试后观察 Pod 是否稳定。"
+  },
+  {
+    "question": "服务 5xx 响应超时，先查什么",
+    "standard_doc_id": "sop.txt#服务响应超时",
+    "standard_answer": "先查健康检查与连接池占用，若下游异常则定位依赖，必要时重启服务并观察。"
+  },
+  {
+    "question": "Java 服务 OutOfMemoryError 怎么办",
+    "standard_doc_id": "sop.txt#内存溢出",
+    "standard_answer": "增大 -Xmx，观察是否缓解；仍频繁则排查内存泄漏点或扩容。"
+  },
+  {
+    "question": "容器启动就 CrashLoop，怎么判断是启动参数错还是探针问题",
+    "standard_doc_id": "sop.txt#服务启动即失败",
+    "standard_answer": "查看应用启动参数、探针配置、启动依赖是否就绪，必要时参考 k8s Pod 排障章节。"
+  },
+  {
+    "question": "磁盘写满了，日志盘不够用",
+    "standard_doc_id": "sop.txt#磁盘写满",
+    "standard_answer": "清理 /var/log 旧日志，扩容磁盘分区，避免日志无限增长。"
+  },
+  {
+    "question": "MySQL 连不上，3306 端口不通",
+    "standard_doc_id": "mysql_troubleshoot.txt#连接失败",
+    "standard_answer": "检查 systemctl status mysql、netstat 3306、防火墙、用户权限、密码。"
+  },
+  {
+    "question": "MySQL 慢查询怎么开启和排查",
+    "standard_doc_id": "mysql_troubleshoot.txt#慢查询",
+    "standard_answer": "开启 slow_query_log，设置 long_query_time，用 mysqldumpslow 分析，查缺失索引/JOIN 条件。"
+  },
+  {
+    "question": "MySQL 磁盘空间不足，binlog 占用大",
+    "standard_doc_id": "mysql_troubleshoot.txt#磁盘空间不足",
+    "standard_answer": "du 看数据目录，SHOW BINARY LOGS，PURGE 过期 binlog，调整 expire_logs_days。"
+  },
+  {
+    "question": "MySQL 主从复制延迟高怎么排查",
+    "standard_doc_id": "mysql_troubleshoot.txt#主从复制延迟",
+    "standard_answer": "看 Slave_IO_Running/Slave_SQL_Running，查网络延迟、磁盘 I/O、长事务。"
+  },
+  {
+    "question": "MySQL InnoDB 锁等待怎么查",
+    "standard_doc_id": "mysql_troubleshoot.txt#InnoDB 锁等待",
+    "standard_answer": "查看 INNODB_LOCKS 和 INNODB_LOCK_WAITS，找到阻塞事务。"
+  },
+  {
+    "question": "Redis 持久化丢失了，RDB 还是 AOF",
+    "standard_doc_id": "redis_persistence.txt#持久化",
+    "standard_answer": "检查 RDB/AOF 配置，确认持久化策略、恢复流程和故障风险。"
+  },
+  {
+    "question": "Prometheus 告警一直触发，怎么分级和处置",
+    "standard_doc_id": "prometheus_alert_triage.txt#告警分级",
+    "standard_answer": "按告警分级、持续时间、影响面判断优先级，执行对应恢复动作。"
+  },
+  {
+    "question": "K8s Pod 一直 ImagePullBackOff，是不是镜像 tag 写错了",
+    "standard_doc_id": "k8s_pod_crashloop.txt#镜像拉取失败",
+    "standard_answer": "检查 image 名称与 tag、镜像仓库权限、network policy。"
+  },
+  {
+    "question": "Pod 事件里有 OOMKilled，怎么确认是内存 limit 问题",
+    "standard_doc_id": "k8s_ops_manual.txt#OOMKilled",
+    "standard_answer": "查看退出码 137 与事件，检查 Pod 内存 limit/request，优化应用内存占用。"
+  },
+  {
+    "question": "应用报 FileNotFound 或 NullPointer 是不是环境变量缺失",
+    "standard_doc_id": "k8s_pod_crashloop.txt#环境变量缺失",
+    "standard_answer": "kubectl describe pod 查看 env，补充缺失环境变量后 rollout。"
+  },
+  {
+    "question": "PVC 挂载不上，容器起不来",
+    "standard_doc_id": "k8s_pod_crashloop.txt#存储挂载问题",
+    "standard_answer": "kubectl get pvc，检查 PV 容量/权限，必要时重新绑定。"
+  },
+  {
+    "question": "K8s 节点上 Pod 状态 Pending 怎么查",
+    "standard_doc_id": "k8s_ops_manual.txt#Pending",
+    "standard_answer": "查看事件、资源 request/limit、节点污点与调度约束。"
+  },
+  {
+    "question": "Service 流量断流，入口不可用怎么判断",
+    "standard_doc_id": "k8s_ops_manual.txt#流量入口",
+    "standard_answer": "查看 Service/Endpoints 就绪端点、Pod 就绪状态，确认是否有断流。"
+  },
+  {
+    "question": "容器日志一直打满磁盘，怎么清理",
+    "standard_doc_id": "sop.txt#磁盘写满",
+    "standard_answer": "清理 /var/log 旧日志，配置日志轮转或限制容器日志大小。"
+  },
+  {
+    "question": "数据库连接池满，API 超时",
+    "standard_doc_id": "sop.txt#服务响应超时",
+    "standard_answer": "先查连接池占用，定位下游服务异常，必要时重启服务并观察。"
+  },
+  {
+    "question": "MySQL 主从 Slave_IO_Running 为 No",
+    "standard_doc_id": "mysql_troubleshoot.txt#主从复制延迟",
+    "standard_answer": "查 SHOW SLAVE STATUS，看 IO 线程错误、网络与复制源配置。"
+  },
+  {
+    "question": "Redis AOF 重写失败怎么处理",
+    "standard_doc_id": "redis_persistence.txt#AOF",
+    "standard_answer": "检查 AOF 文件与磁盘空间，配置重写策略，必要时手动触发重写。"
+  },
+  {
+    "question": "Prometheus 查询慢，指标太多",
+    "standard_doc_id": "prometheus_alert_triage.txt#查询慢",
+    "standard_answer": "优化 PromQL、缩小时间范围、减少高基数标签，检查存储与查询负载。"
+  },
+  {
+    "question": "K8s 滚动更新一直未就绪，会不会误判故障",
+    "standard_doc_id": "k8s_ops_manual.txt#滚动更新",
+    "standard_answer": "区分滚动更新瞬时未就绪与真实故障，结合探针与事件判断，避免误判 REGRESSED。"
+  },
+  {
+    "question": "MySQL 密码忘记怎么重置",
+    "standard_doc_id": "mysql_troubleshoot.txt#密码错误",
+    "standard_answer": "ALTER USER 'root'@'localhost' IDENTIFIED BY 'new_password'，并确认权限。"
+  }
+]

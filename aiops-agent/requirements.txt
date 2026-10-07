@@ -10,3 +10,7 @@ python-multipart
 sse-starlette
 dashscope
 python-dotenv
+rank-bm25
+jieba
+redis
+langfuse

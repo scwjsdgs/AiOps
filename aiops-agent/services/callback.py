@@ -1,10 +1,13 @@
 import asyncio
-from datetime import datetime
+import datetime
+import logging
 
 import httpx
 
 from models import AgentMessage, ToolExecutionRequest, ToolExecutionResult
 from config import config
+
+logger = logging.getLogger(__name__)
 
 
 class CallbackService:
@@ -33,11 +36,11 @@ class CallbackService:
             type="STEP",
             taskId=task_id,
             content=content,
-            stepName=step_name,
+            step_name=step_name,
         )
         payload = message.model_dump()
         # Java 侧 AgentMessage.timestamp 是 LocalDateTime，前端实时页要显示这一列
-        payload["timestamp"] = datetime.now().isoformat()
+        payload["timestamp"] = datetime.datetime.now().isoformat()
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             try:
@@ -47,7 +50,7 @@ class CallbackService:
                     headers=self._headers,
                 )
             except Exception as e:
-                print(f"回调失败（可忽略）: {e}")
+                logger.warning(f"回调失败（可忽略）: {e}")
 
     async def execute_tool(self, task_id: str, tool_name: str, parameters: dict) -> ToolExecutionResult:
         request = ToolExecutionRequest(
@@ -79,11 +82,21 @@ class CallbackService:
                 data=data.get("data") or {},
             )
 
-    async def complete_task(self, task_id: str, result: str, status: str = "SUCCESS"):
+    async def complete_task(
+        self,
+        task_id: str,
+        result: str,
+        status: str = "SUCCESS",
+        service_name: str = "",
+        alert_name: str = "",
+    ):
         """回传最终报告。
 
         报告可能上万字且含换行、&、#，必须走 JSON body。
         之前拼在 query string 里，轻则被 # 截断，重则超出请求行长度上限被拒。
+
+        service_name / alert_name：随报告一起传给案例库入库（自学习闭环），
+        让历史案例的 metadata 不再依赖从报告文本里猜服务名（猜不中就是 unknown）。
         """
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             try:
@@ -94,15 +107,17 @@ class CallbackService:
                 )
                 resp.raise_for_status()
             except Exception as e:
-                print(f"完成回调失败: {e}")
+                logger.warning(f"完成回调失败: {e}")
 
         # 自学习闭环：报告回传成功后，异步把它沉淀进案例库。
         # 这是增强不是主链路——入库失败绝不影响回调本身，也不阻塞返回。
+        # service/alert_name 显式传入，修掉「日志 service=unknown」：之前
+        # 只传报告正文，case_store 只能靠正则猜，猜不到全落 unknown。
         try:
             from rag.case_store import save_case
-            await asyncio.to_thread(save_case, result, "", "", status)
+            await asyncio.to_thread(save_case, result, service_name, alert_name, status)
         except Exception as e:
-            print(f"案例入库失败（可忽略）: {e}")
+            logger.warning(f"案例入库失败（可忽略）: {e}")
 
 
 callback_service = CallbackService()

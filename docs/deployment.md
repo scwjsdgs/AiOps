@@ -57,6 +57,15 @@ K8s 操作通过 fabric8 客户端执行，namespace 默认为 `default`，可�
 | `EMBEDDING_MODEL` | embedding 模型名（如 qwen3.7-text-embedding-flash） |
 | `AGENT_MAX_ITERATIONS` | ReAct 推理最大轮数（默认 8） |
 | `AGENT_TIMEOUT_SECONDS` | 单任务整体超时（默认 300） |
+| `QUERY_REWRITE_ENABLED` | 检索前是否用 qwen-turbo 润色口语 Query（默认 true） |
+| `QUERY_REWRITE_MODEL` | Query 润色模型名（默认 qwen-turbo） |
+| `RAG_BM25_ENABLED` | 是否启用 BM25 关键词检索通道（默认 true） |
+| `RERANK_ENABLED` | RRF 粗排后是否用 gte-rerank 精排 Top3（默认 true，失败自动降级） |
+| `REFLECTION_ENABLED` | 报告生成后是否审阅防幻觉，PASS 才回调 Java（默认 true） |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` | AgentState 断点续传 / 审批恢复用的 Redis |
+| `LANGFUSE_ENABLED` | 是否启用 LangFuse 可观测性（默认 false；启动见 docs/langfuse.md） |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` / `S3_BUCKET` / `S3_REGION` | LangFuse v3 使用的 MinIO/S3 存储；compose 首次启动会通过 `minio-init` 自动建 bucket |
+| `langfuse-worker` | LangFuse v3 队列消费者，负责把 web 入队的 OTEL/ingestion 事件写入 ClickHouse；缺少它会表现为 HTTP 正常但无 Trace |
 
 ### 前端（ops-agent-front）
 

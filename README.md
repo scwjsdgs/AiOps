@@ -109,7 +109,7 @@ flowchart TB
 - **ChatOps 交互式诊断**：前端对话窗口直接问「nginx 为什么重启？」，SSE 流式展示推理过程与报告。
 - **四层安全防线**：JWT 登录认证、内部 Token 认证（不出 Java）、高危操作人工审批、防重复执行。
 - **实时推送**：基于 WebSocket 将推理过程与执行结果实时推送至前端。
-- **RAG 知识库**：Chroma 双 collection（SOP 知识库 + 历史案例库），知识库不可用时自动降级，不影响主链路。
+- **RAG 知识库**：Chroma 双 collection（SOP 知识库 + 历史案例库），检索走「Query 润色 + BM25/向量双路 + RRF + Rerank 精排」工业级流水线，知识库不可用时自动降级，不影响主链路。
 - **六维度评测体系**：诊断完整性/审批合规/修复验证/报告诚实/LLM-as-judge，含 `--self-test` 与 `--judge`。
 
 ## 3.1 前瞻式运维能力
@@ -188,6 +188,9 @@ opsagent:
 
 9. **ChatOps 经 Java 中转而非前端直连 Python**
    Python 用 `X-Internal-Token` 鉴权，前端不该持有内部密钥——密钥一出 Java 就失控。Java 只做流式代理（SSE），保持安全边界。
+
+10. **工业级 RAG 检索流水线**
+    检索路径：口语 Query → qwen-turbo 润色（标准运维术语）→ BM25 关键词 + Chroma 向量双路召回 → RRF 融合 → gte-rerank 精排 Top3。配合 `AgentState`（审批断点续传）、`Reflection`（报告防幻觉，PASS 才回调）、`LangFuse`（LLM/工具 Trace）与 `Hit@K/MRR` 检索评估，便于把 RAG 效果持续量化提升。
 
 ## 4. 运行环境
 

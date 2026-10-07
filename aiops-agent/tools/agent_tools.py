@@ -56,7 +56,9 @@ def create_tools(task_id: str):
             # 案例在前——它是「上次遇到同样的问题是怎么修好的」，对本次决策最直接有用。
             from rag.case_store import search_cases
             cases = await asyncio.to_thread(search_cases, query, 3)
-            docs = await asyncio.to_thread(vector_store.similarity_search, query, k=3)
+            # 知识库走混合检索（润色 Query + BM25/向量双路 + RRF + Rerank）
+            from rag.vector_store import hybrid_search
+            docs = await asyncio.to_thread(hybrid_search, query, 3)
 
             parts = []
             if cases:
@@ -64,7 +66,7 @@ def create_tools(task_id: str):
                          for i, c in enumerate(cases)]
                 parts.append("历史相似案例：\n\n" + "\n\n".join(lines))
             if docs:
-                parts.append("知识库参考：\n" + "\n\n".join([doc.page_content for doc in docs]))
+                parts.append("知识库参考：\n" + "\n\n".join([d[0] for d in docs]))
             if not parts:
                 return "未找到相关历史记录。"
             return "\n\n".join(parts)

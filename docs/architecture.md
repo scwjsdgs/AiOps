@@ -46,7 +46,11 @@ sequenceDiagram
 - 基于 FastAPI 暴露 HTTP 接口，启动时挂定时巡检协程（每天 8:00 全服务健康检查）。
 - 使用 LangChain ReAct Agent 做多轮推理（默认上限 8 轮，受 `AGENT_MAX_ITERATIONS` 控制）。
 - 支持 10 个工具：知识库检索、服务状态查询、日志分析、Pod 事件查询、Prometheus 指标查询、影响面分析、重启/清缓存、扩缩容、回滚、人工审批。
-- 使用 Chroma 做向量检索（RAG），embedding 走阿里云百炼 DashScope 原生接口（`DASHSCOPE_API_KEY`），与 DeepSeek 对话模型相互独立。知识库不可用时自动降级工具，不阻断主链路。
+- RAG 检索已升级为工业级流水线：Query 润色（qwen-turbo 口语改写）→ BM25 关键词 + Chroma 向量双路召回 → RRF 粗排 → Rerank 精排 Top3（DashScope gte-rerank，失败自动降级）。embedding 走阿里云百炼原生接口（`DASHSCOPE_API_KEY`），与 DeepSeek 对话模型相互独立；知识库不可用时自动降级工具，不阻断主链路。
+- 检索评估：`rag/retrieval_eval.py` 基于 30 条“问题 + 标准文档”测试集计算 Hit@K / MRR；当前实测 Hit@3=0.87、MRR=0.79（Rerank/润色关闭的基线链路）。
+- AgentState：每个任务在 ReAct 循环中维护 core_intent/current_subtask/pending_tools/completed_steps，审批挂起前序列化为 JSON 存 Redis，支撑断点续传和审批恢复。
+- Reflection：最终报告会结合检索/工具观测原文重新审阅（`PASS`/指出幻觉），只有 PASS 才回调 Java；失败会尝试修订或按 FAILED 回传。
+- LangFuse：通过 `observability/langfuse_client.py` 接入 LangChain Callback，追踪 LLM 调用、Token 消耗、工具执行与慢 Trace 瀑布图。
 
 ### Java 后端（ops_agent）
 

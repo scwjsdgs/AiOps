@@ -1,5 +1,5 @@
 import os
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # LLM 配置（以 Qwen 为例，使用 OpenAI 兼容接口）
@@ -43,12 +43,58 @@ class Settings(BaseSettings):
     DASHSCOPE_API_KEY: str = os.getenv("DASHSCOPE_API_KEY", "")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "qwen3.7-text-embedding-flash")
 
+    # Query 润色：用便宜模型把口语化提问改写成标准检索 Query。
+    # 默认跟随主 LLM 配置；也可单独指定 qwen-turbo 通道（KEY/BASE 可与主 LLM 不同）。
+    QUERY_REWRITE_ENABLED: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    QUERY_REWRITE_MODEL: str = os.getenv("QUERY_REWRITE_MODEL", "qwen-turbo")
+    QUERY_REWRITE_API_KEY: str = os.getenv("QUERY_REWRITE_API_KEY", "")
+    QUERY_REWRITE_BASE_URL: str = os.getenv("QUERY_REWRITE_BASE_URL", "")
+
+    # 混合检索：BM25 / 向量检索 / RRF
+    RAG_BM25_ENABLED: bool = os.getenv("RAG_BM25_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    RAG_RRF_K: int = int(os.getenv("RAG_RRF_K", "60"))
+
+    # Rerank：RRF 粗排 Top20 后精排取 Top3
+    RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "gte-rerank")
+    RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", "3"))
+
     # Java 后端地址（ops_agent 监听 8081）
     JAVA_BASE_URL: str = os.getenv("JAVA_BASE_URL", "http://localhost:8081")
 
     # 与 Java 约定的内部共享密钥。回调接口必须携带 X-Internal-Token，
     # 因为这些接口能触发 restart/scale 等真实运维操作，不能裸奔放行。
     JAVA_INTERNAL_TOKEN: str = os.getenv("JAVA_INTERNAL_TOKEN", "dev-internal-token")
+
+    # Query 润色 / 混合检索 / Rerank
+    QUERY_REWRITE_ENABLED: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    QUERY_REWRITE_MODEL: str = os.getenv("QUERY_REWRITE_MODEL", "qwen-turbo")
+    QUERY_REWRITE_BASE_URL: str = os.getenv("QUERY_REWRITE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    QUERY_REWRITE_API_KEY: str = os.getenv("QUERY_REWRITE_API_KEY", "")
+
+    RAG_BM25_ENABLED: bool = os.getenv("RAG_BM25_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    RAG_RRF_K: int = int(os.getenv("RAG_RRF_K", "60"))
+
+    RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "gte-rerank")
+    RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", "3"))
+
+    # LangFuse 可观测性（默认关闭，配置齐了自动启用）
+    LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "http://localhost:3030")
+    LANGFUSE_PUBLIC_KEY: str = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    LANGFUSE_SECRET_KEY: str = os.getenv("LANGFUSE_SECRET_KEY", "")
+
+    # Redis（AgentState 断点续传 / 审批恢复）
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+
+    # Reflection（报告事后审阅，防幻觉；写回 Java 前必须 PASS）
+    REFLECTION_ENABLED: bool = os.getenv("REFLECTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    REFLECTION_MODEL: str = os.getenv("REFLECTION_MODEL", "qwen-turbo")
+    REFLECTION_BASE_URL: str = os.getenv("REFLECTION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    REFLECTION_API_KEY: str = os.getenv("REFLECTION_API_KEY", "")
 
     # 主动巡检配置
     # HEALTH_CHECK_ENABLED=false 关闭定时巡检；HEALTH_CHECK_INTERVAL_HOURS>0 时按该间隔周期性巡检，
@@ -62,7 +108,9 @@ class Settings(BaseSettings):
     HTTP_READ_TIMEOUT: float = float(os.getenv("HTTP_READ_TIMEOUT", "60"))
     HTTP_WRITE_TIMEOUT: float = float(os.getenv("HTTP_WRITE_TIMEOUT", "10"))
 
-    class Config:
-        env_file = ".env"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",  # 忽略 .env 中未定义的变量（如 LangFuse/Postgres 等辅助键）
+    )
 
 config = Settings()

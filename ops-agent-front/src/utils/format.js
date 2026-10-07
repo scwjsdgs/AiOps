@@ -42,10 +42,6 @@ export const formatDate = (v) => {
   if (!d) return '—'
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
-  const d = parseDateTime(v)
-  if (!d) return '—'
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
 
 /**
  * 相对时间："刚刚 / 3 分钟前 / 2 小时前 / 3 天前"。

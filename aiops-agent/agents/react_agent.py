@@ -6,6 +6,8 @@ from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
 from config import config
 from tools.agent_tools import create_tools
 from agents.memory_manager import memory_manager
+from agents.agent_state import AgentState, save_state, suspend_for_approval, clear_state, load_state
+from observability.langfuse_client import get_langfuse_callback_handler, finalize as langfuse_finalize
 from services.callback import callback_service
 from models import Alert
 
@@ -74,6 +76,7 @@ async def run_react_loop(
         max_iterations = config.AGENT_MAX_ITERATIONS
 
     memory = memory_manager.get_memory(task_id)
+    langfuse_cb = get_langfuse_callback_handler()
     llm = ChatOpenAI(
         model=config.LLM_MODEL,
         openai_api_key=config.LLM_API_KEY,
@@ -84,8 +87,11 @@ async def run_react_loop(
         streaming=False,
         timeout=config.LLM_TIMEOUT_SECONDS,
         max_retries=config.LLM_MAX_RETRIES,
+        callbacks=[langfuse_cb] if langfuse_cb else None,
     )
     tools = create_tools(task_id)
+    # 显式状态机：核心意图就是本次输入；后续检索/工具/审批/报告都记录在这里。
+    state = AgentState(task_id=task_id, core_intent=user_input[:200])
 
     # 关键：必须把工具声明绑定到 LLM 上。
     # 不绑定的话，请求里没有任何 tools 声明，网关永远不会返回 tool_calls，
@@ -177,17 +183,32 @@ async def run_react_loop(
                 yield json.dumps({"type": "error", "data": observation}, ensure_ascii=False)
             else:
                 call_signatures[sig] = call_signatures.get(sig, 0) + 1
+                # ---- 状态机维护：记录工具调用意图（在真正执行前持久化） ----
+                state.current_subtask = f"执行 {tool_name}"
+                state.start_tool(tool_name, tool_args)
+                # 人工审批工具触发前，把 AgentState 挂起保存到 Redis，
+                # 供审批结束后的断点续传使用（fail-safe，保存失败不中断主流程）。
+                if tool_name == "request_human_approval":
+                    suspend_for_approval(
+                        state,
+                        {"operation": tool_args.get("operation", ""),
+                         "reason": tool_args.get("reason", "")},
+                    )
                 try:
                     observation = await tool_func.ainvoke(tool_args)
                 except Exception as e:
                     observation = f"工具执行失败: {str(e)}"
                     yield json.dumps({"type": "error", "data": observation}, ensure_ascii=False)
+                state.finish_tool(tool_name)
+                state.add_step(f"{tool_name} 完成")
 
             yield json.dumps(
                 {"type": "observation", "data": str(observation)}, ensure_ascii=False
             )
             messages.append(ToolMessage(content=str(observation), tool_call_id=tc["id"]))
             observations_log.append(f"[{tool_name}] {str(observation)[:400]}")
+            # 每轮结束持久化状态（含已完成步骤），便于审计/断点恢复
+            save_state(state)
 
         iteration += 1
 
@@ -211,6 +232,10 @@ async def run_react_loop(
     memory.chat_memory.add_user_message(user_input)
     memory.chat_memory.add_ai_message(final_answer or "")
     memory_manager.save_memory(task_id)
+    # 把观测证据写进状态机上下文，供 Reflection / 断点续传使用
+    state.context["observations"] = observations_log[-20:]
+    state.completed_steps.append("报告生成")
+    save_state(state)
 
 
 def _build_fallback_report(
@@ -249,6 +274,38 @@ def _build_fallback_report(
     return "\n".join(lines)
 
 
+async def _revise_report_with_feedback(report: str, feedback: str, evidence: str = "") -> str:
+    """根据 Reflection 审阅意见，让模型修订报告。
+
+    修订仍要求基于原文，不能凭空补内容；失败时原样返回，避免丢报告。
+    """
+    try:
+        llm = ChatOpenAI(
+            model=config.LLM_MODEL,
+            openai_api_key=config.LLM_API_KEY,
+            openai_api_base=config.LLM_BASE_URL,
+            temperature=0,
+        )
+        messages = [
+            SystemMessage(content=(
+                "你是资深 SRE 报告修订专家。请根据审阅意见修订以下运维诊断报告。"
+                "必须严格基于给定原文材料与工具观测，不得编造事实、数据或操作结果。"
+                "只输出修订后的完整报告。"
+            )),
+            HumanMessage(content=(
+                f"【原文材料/观测】\n{evidence or '（无）'}\n\n"
+                f"【审阅意见】\n{feedback}\n\n"
+                f"【原报告】\n{report}"
+            )),
+        ]
+        result = await llm.ainvoke(messages)
+        revised = (result.content or "").strip()
+        return revised or report
+    except Exception as e:
+        logger.warning(f"报告修订失败，保留原报告: {e}")
+        return report
+
+
 async def run_agent_for_alert(task_id: str, alert: Alert) -> str:
     """非流式入口：跑完整个 ReAct 循环并把最终报告回传给 Java。"""
     user_input = (
@@ -271,5 +328,36 @@ async def run_agent_for_alert(task_id: str, alert: Alert) -> str:
 
     if final is None:
         final = "处理失败，未获得最终报告。"
-    await callback_service.complete_task(task_id, final)
+
+    # ---- Reflection 防幻觉：结合检索原文/观测审阅，PASS 才回调 Java ----
+    from agents.reflection import reflect_on_report
+    state = load_state(task_id) or AgentState(task_id=task_id, core_intent=user_input[:200])
+    observations_log = state.context.get("observations") or []
+    evidence = "\n".join(observations_log[-10:]) if observations_log else ""
+    review = reflect_on_report(final, evidence)
+    if not review["passed"]:
+        # 审阅不过：把模型指出的错误回注，重跑一轮“修正版”报告
+        logger.warning(f"Reflection 未通过，尝试修订: {review['feedback']}")
+        final = _revise_report_with_feedback(final, review["feedback"], evidence)
+        review2 = reflect_on_report(final, evidence)
+        if not review2["passed"]:
+            logger.warning("Reflection 二次仍未通过，按 FAILED 回传")
+            await callback_service.complete_task(
+                task_id, final, status="FAILED",
+                service_name=alert.serviceName or "",
+                alert_name=alert.title or "",
+            )
+            clear_state(task_id)
+            langfuse_finalize()
+            return final
+
+    # 携带 serviceName/title 一并入库，让案例库 metadata 有真实服务名
+    await callback_service.complete_task(
+        task_id,
+        final,
+        service_name=alert.serviceName or "",
+        alert_name=alert.title or "",
+    )
+    clear_state(task_id)
+    langfuse_finalize()
     return final
