@@ -5,9 +5,10 @@ from services.callback import callback_service
 
 logger = logging.getLogger(__name__)
 
-# 在飞任务注册表：同一个 taskId 只允许一个 ReAct 循环在跑。
+# 在飞任务注册表：同一个 taskId 只允许一个 LangGraph 状态图在跑。
 # 这是「重复执行」问题的第一道闸门 —— 上游（Java）无论因为超时重发还是手工重试，
 # 都不会让重启/扩容这类非幂等操作被执行两次。
+# 审批挂起后图状态由 Redis Checkpointer 接管，Java resume 走 /api/agent/resume。
 _inflight: dict[str, asyncio.Task] = {}
 
 

@@ -37,15 +37,17 @@ def reflect_on_report(report: str, evidence: str = "") -> dict:
         return {"passed": True, "feedback": "报告为空，跳过审阅"}
 
     try:
-        # Reflection 默认走 DashScope（embedding/Rerank 同通道）：
-        # 单独 key 优先，否则用 DASHSCOPE_API_KEY；base 同理。
-        api_key = config.REFLECTION_API_KEY or config.DASHSCOPE_API_KEY or config.LLM_API_KEY
-        base_url = config.REFLECTION_BASE_URL or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        # Reflection 统一走 DeepSeek；单独 key 优先，否则跟随主 LLM。
+        api_key = config.REFLECTION_API_KEY or config.LLM_API_KEY
+        base_url = config.REFLECTION_BASE_URL or config.LLM_BASE_URL
         llm = ChatOpenAI(
             model=config.REFLECTION_MODEL,
             openai_api_key=api_key,
             openai_api_base=base_url,
             temperature=0,
+            timeout=15,
+            max_retries=1,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         user_content = (
             f"【原文材料】\n{evidence or '（本次未提供检索原文，仅审阅报告自身一致性）'}\n\n"

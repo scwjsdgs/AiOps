@@ -5,6 +5,9 @@ pydantic-settings
 langchain
 langchain-openai
 langchain-community
+langchain-chroma
+langgraph
+langgraph-checkpoint-sqlite
 chromadb
 python-multipart
 sse-starlette

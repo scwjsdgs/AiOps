@@ -43,7 +43,7 @@ def _get_store():
     if _last_failure_at and (now - _last_failure_at) < _FAILURE_COOLDOWN_SECONDS:
         return None
     try:
-        from langchain_community.vectorstores import Chroma
+        from langchain_chroma import Chroma
         persist_dir = os.path.join(config.VECTOR_STORE_DIR, "cases")
         _store = Chroma(
             collection_name=_CASE_COLLECTION,

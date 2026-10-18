@@ -3,7 +3,7 @@
 """
 task_runner.submit 去重逻辑单元测试。
 
-防守点：同一 taskId 只允许一个 ReAct 循环在跑 —— Java 超时重发或手工重试时，
+防守点：同一 taskId 只允许一个 LangGraph 状态图在跑 —— Java 超时重发或手工重试时，
 绝不能让重启/扩容这类非幂等操作被执行两次。
 """
 import asyncio

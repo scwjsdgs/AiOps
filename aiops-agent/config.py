@@ -2,20 +2,20 @@ import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    # LLM 配置（以 Qwen 为例，使用 OpenAI 兼容接口）
+    # LLM 配置（DeepSeek，OpenAI 兼容接口）
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "your-api-key-here")
-    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen-plus")
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "deepseek-flash")
 
     # 单次 LLM 调用的超时（秒）与失败重试次数
     LLM_TIMEOUT_SECONDS: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
     LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "2"))
 
-    # 单个告警任务（整个 ReAct 循环）的整体超时（秒）
+    # 单个告警任务（整个 LangGraph 状态图）的整体超时（秒）
     AGENT_TIMEOUT_SECONDS: int = int(os.getenv("AGENT_TIMEOUT_SECONDS", "300"))
 
-    # ReAct 最大迭代轮数。多步运维通常需要「查状态 -> 查日志 -> 重启 -> 验证 -> 总结」，
-    # 5 轮不够用，会中途撞上限。
+    # 原 ReAct 最大迭代轮数。LangGraph 状态图已用条件边/retry_count 替代 while，
+    # 这里作为单节点内部工具调用步数上限与整体兜底，保留向后兼容。
     AGENT_MAX_ITERATIONS: int = int(os.getenv("AGENT_MAX_ITERATIONS", "8"))
 
     # 单次分析中 query_metrics 的调用上限。LLM 会陷入「反复查指标佐证已有结论」的循环，
@@ -43,12 +43,11 @@ class Settings(BaseSettings):
     DASHSCOPE_API_KEY: str = os.getenv("DASHSCOPE_API_KEY", "")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "qwen3.7-text-embedding-flash")
 
-    # Query 润色：用便宜模型把口语化提问改写成标准检索 Query。
-    # 默认跟随主 LLM 配置；也可单独指定 qwen-turbo 通道（KEY/BASE 可与主 LLM 不同）。
+    # Query 润色：默认与主模型同通道，统一走 DeepSeek，降低多供应商限流与成本。
     QUERY_REWRITE_ENABLED: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    QUERY_REWRITE_MODEL: str = os.getenv("QUERY_REWRITE_MODEL", "qwen-turbo")
+    QUERY_REWRITE_MODEL: str = os.getenv("QUERY_REWRITE_MODEL", "deepseek-flash")
     QUERY_REWRITE_API_KEY: str = os.getenv("QUERY_REWRITE_API_KEY", "")
-    QUERY_REWRITE_BASE_URL: str = os.getenv("QUERY_REWRITE_BASE_URL", "")
+    QUERY_REWRITE_BASE_URL: str = os.getenv("QUERY_REWRITE_BASE_URL", "https://api.deepseek.com/v1")
 
     # 混合检索：BM25 / 向量检索 / RRF
     RAG_BM25_ENABLED: bool = os.getenv("RAG_BM25_ENABLED", "true").lower() in ("1", "true", "yes", "on")
@@ -66,34 +65,24 @@ class Settings(BaseSettings):
     # 因为这些接口能触发 restart/scale 等真实运维操作，不能裸奔放行。
     JAVA_INTERNAL_TOKEN: str = os.getenv("JAVA_INTERNAL_TOKEN", "dev-internal-token")
 
-    # Query 润色 / 混合检索 / Rerank
-    QUERY_REWRITE_ENABLED: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    QUERY_REWRITE_MODEL: str = os.getenv("QUERY_REWRITE_MODEL", "qwen-turbo")
-    QUERY_REWRITE_BASE_URL: str = os.getenv("QUERY_REWRITE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    QUERY_REWRITE_API_KEY: str = os.getenv("QUERY_REWRITE_API_KEY", "")
-
-    RAG_BM25_ENABLED: bool = os.getenv("RAG_BM25_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    RAG_RRF_K: int = int(os.getenv("RAG_RRF_K", "60"))
-
-    RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "gte-rerank")
-    RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", "3"))
-
     # LangFuse 可观测性（默认关闭，配置齐了自动启用）
     LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
     LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "http://localhost:3030")
     LANGFUSE_PUBLIC_KEY: str = os.getenv("LANGFUSE_PUBLIC_KEY", "")
     LANGFUSE_SECRET_KEY: str = os.getenv("LANGFUSE_SECRET_KEY", "")
 
-    # Redis（AgentState 断点续传 / 审批恢复）
+    # Redis（Java 侧任务/审批/幂等去重）
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
 
+    # LangGraph 审批断点使用 SQLite 持久化（不需要 Redis Search）
+    GRAPH_CHECKPOINT_DB_PATH: str = os.getenv("GRAPH_CHECKPOINT_DB_PATH", "./rag/checkpoints.sqlite")
+
     # Reflection（报告事后审阅，防幻觉；写回 Java 前必须 PASS）
     REFLECTION_ENABLED: bool = os.getenv("REFLECTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    REFLECTION_MODEL: str = os.getenv("REFLECTION_MODEL", "qwen-turbo")
-    REFLECTION_BASE_URL: str = os.getenv("REFLECTION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    REFLECTION_MODEL: str = os.getenv("REFLECTION_MODEL", "deepseek-flash")
+    REFLECTION_BASE_URL: str = os.getenv("REFLECTION_BASE_URL", "https://api.deepseek.com/v1")
     REFLECTION_API_KEY: str = os.getenv("REFLECTION_API_KEY", "")
 
     # 主动巡检配置
@@ -104,9 +93,27 @@ class Settings(BaseSettings):
 
     # 调用 Java 的 HTTP 超时（秒）。read 必须足够长：
     # restart_service 在 Java 侧本身就要跑好几秒（缩容、等待、扩容）。
+    # 人工审批已不再占用这个 read timeout：审批走 interrupt() 挂起后异步恢复。
     HTTP_CONNECT_TIMEOUT: float = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
     HTTP_READ_TIMEOUT: float = float(os.getenv("HTTP_READ_TIMEOUT", "60"))
     HTTP_WRITE_TIMEOUT: float = float(os.getenv("HTTP_WRITE_TIMEOUT", "10"))
+
+    # ---------- 防死循环 ----------
+    # LangGraph 图总步数上限（recursion_limit，硬闸门，条件边之外的兜底）
+    GRAPH_RECURSION_LIMIT: int = int(os.getenv("GRAPH_RECURSION_LIMIT", "40"))
+    # 主流程条件边允许的最大迭代轮数（iteration_count 达到后强制进 reporter 收束）
+    MAX_ITERATION_ROUNDS: int = int(os.getenv("MAX_ITERATION_ROUNDS", "6"))
+
+    # ---------- Token 优化：消息滑动窗口 ----------
+    # 每个 Agent 子图内，LLM 循环保留的最近消息条数。LangGraph 的
+    # trim_messages 会在每次进入队列式 Worker 前压缩超出窗口的旧消息。
+    MESSAGES_WINDOW_SIZE: int = int(os.getenv("MESSAGES_WINDOW_SIZE", "12"))
+    # trim_messages 的 token 上限（长日志/多轮对话超过后压缩）
+    TRIM_MESSAGES_MAX_TOKENS: int = int(os.getenv("TRIM_MESSAGES_MAX_TOKENS", "4000"))
+
+    # ---------- Send API 多 Pod 并发诊断 ----------
+    # 并行诊断最大并发数，编译图/运行时通过 config={"max_concurrency": N} 生效
+    PARALLEL_POD_DIAGNOSIS_MAX_CONCURRENCY: int = int(os.getenv("PARALLEL_POD_DIAGNOSIS_MAX_CONCURRENCY", "5"))
 
     model_config = SettingsConfigDict(
         env_file=".env",

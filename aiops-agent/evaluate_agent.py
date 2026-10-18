@@ -31,9 +31,9 @@ import sys
 import httpx
 
 # LLM-as-judge 配置（与主 agent 同源：.env / 环境变量）
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
 
 
 # ----------------------------- 常量与工具 -----------------------------

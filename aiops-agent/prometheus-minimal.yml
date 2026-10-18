@@ -1,0 +1,12 @@
+# 最小 Prometheus 配置：用于本地指标大盘/工具连通性恢复。
+# 只保证 Prometheus 自身 up，以及常规 self 指标可用。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+        labels:
+          job: prometheus
