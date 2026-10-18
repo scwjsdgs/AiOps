@@ -15,7 +15,9 @@ const routes = [
       { path: 'tasks', component: () => import('@/views/Task.vue') },
       { path: 'tools', component: () => import('@/views/Tool.vue') },
       { path: 'realtime', component: () => import('@/views/RealTime.vue') },
-      { path: 'chatops', component: () => import('@/views/ChatOps.vue') }
+      { path: 'chatops', component: () => import('@/views/ChatOps.vue') },
+      { path: 'audit', component: () => import('@/views/AuditLogs.vue') },
+      { path: 'root-cause', component: () => import('@/views/RootCause.vue') }
     ]
   }
 ]

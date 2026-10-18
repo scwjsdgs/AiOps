@@ -164,7 +164,13 @@ const toolIcon = (name) => {
     rollback: Refresh,
     clear_cache: Delete,
     request_human_approval: Stamp,
-    generic_command: Connection
+    generic_command: Connection,
+    config_rollback: Refresh,
+    traffic_switch: Share,
+    pod_evict: Delete,
+    node_drain: Connection,
+    adjust_connection_pool: DataLine,
+    adjust_health_check: Cpu
   }
   return map[name] || Tools
 }
@@ -181,7 +187,13 @@ const EXAMPLES = {
   rollback: { deployment: 'nginx', namespace: 'default' },
   clear_cache: { deployment: 'nginx', namespace: 'default' },
   request_human_approval: { operation: 'rollback nginx', reason: '可疑版本，需回滚验证' },
-  generic_command: { command: 'kubectl get pods -n default' }
+  generic_command: { command: 'kubectl get pods -n default' },
+  config_rollback: { deployment: 'nginx', namespace: 'default' },
+  traffic_switch: { service: 'nginx', activeDeployment: 'nginx', standbyDeployment: 'nginx-blue', namespace: 'default' },
+  pod_evict: { podName: 'nginx-xxxxxxxxxx-xxxxx', namespace: 'default' },
+  node_drain: { node: 'aiops-worker', action: 'drain' },
+  adjust_connection_pool: { deployment: 'mysql-app', namespace: 'default', poolKey: 'DB_POOL_MAX', poolValue: '50' },
+  adjust_health_check: { deployment: 'nginx', namespace: 'default', probe: 'readiness', initialDelaySeconds: 10, failureThreshold: 5 }
 }
 
 const loadTools = async () => {

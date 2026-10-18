@@ -1,122 +1,164 @@
 <template>
-  <div class="page">
-    <el-card body-style="padding: 0;">
-      <div class="chat-head">
-        <div>
-          <h3 class="page-title">
-            <el-icon><ChatDotRound /></el-icon>ChatOps 交互式诊断
-            <el-tag v-if="busy" type="warning" size="small" effect="light">
-              <el-icon class="is-loading"><Loading /></el-icon> 推理中
-            </el-tag>
-          </h3>
-          <p class="page-subtitle" style="margin-top: 4px;">
-            直接问一句，agent 会现场查状态 / 日志 / 事件 / 指标，推理过程流式返回。
-          </p>
+  <div class="page chatops-page">
+    <div class="chatops-shell">
+      <!-- 会话侧边栏 -->
+      <aside class="session-sidebar">
+        <div class="session-sidebar__head">
+          <div class="session-sidebar__title">对话</div>
+          <el-button
+            class="session-sidebar__new"
+            type="primary"
+            :icon="Plus"
+            :disabled="busy"
+            @click="createNewSession"
+          >新建对话</el-button>
         </div>
-        <el-button :icon="Delete" :disabled="!messages.length || busy" @click="clearChat">清空对话</el-button>
-      </div>
-
-      <div class="chat-body" ref="chatContainer">
-        <!-- 空状态：给几个能直接点的示例问题，比一句干巴巴的提示有用 -->
-        <div v-if="!messages.length" class="chat-empty">
-          <div class="chat-empty__icon">
-            <el-icon :size="34"><ChatDotRound /></el-icon>
+        <div class="session-list">
+          <div
+            v-for="s in sessions"
+            :key="s.session_id"
+            class="session-item"
+            :class="{ 'session-item--active': s.session_id === currentSessionId }"
+            @click="switchSession(s.session_id)"
+          >
+            <div class="session-item__title">{{ s.title || '未命名对话' }}</div>
+            <div class="session-item__meta">{{ formatTime(s.updated_at) }}</div>
           </div>
-          <h4 class="chat-empty__title">问点什么？</h4>
-          <p class="chat-empty__desc">
-            agent 会自主调用工具排查，并给出带证据链的诊断报告。
-          </p>
-          <div class="chat-empty__chips">
-            <el-button
-              v-for="q in SAMPLE_QUESTIONS"
-              :key="q"
-              size="small"
-              round
-              @click="askSample(q)"
-            >{{ q }}</el-button>
+          <div v-if="!sessions.length && !loadingSessions" class="session-empty">
+            还没有历史对话
+          </div>
+          <div v-if="loadingSessions" class="session-loading">
+            <el-icon class="is-loading"><Loading /></el-icon> 加载中
           </div>
         </div>
+      </aside>
 
-        <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="`msg--${m.role}`">
-          <div class="msg__avatar">
-            <el-icon v-if="m.role === 'agent'"><MagicStick /></el-icon>
-            <span v-else>{{ userInitial }}</span>
+      <!-- 对话主体 -->
+      <div class="chat-main">
+        <el-card body-style="padding: 0;" class="chat-card">
+          <div class="chat-head">
+            <div>
+              <h3 class="page-title">
+                <el-icon><ChatDotRound /></el-icon>ChatOps 交互式诊断
+                <el-tag v-if="busy" type="warning" size="small" effect="light">
+                  <el-icon class="is-loading"><Loading /></el-icon> 推理中
+                </el-tag>
+              </h3>
+              <p class="page-subtitle" style="margin-top: 4px;">
+                直接问一句，agent 会现场查状态 / 日志 / 事件 / 指标，推理过程流式返回。
+              </p>
+            </div>
+            <el-button :icon="Delete" :disabled="!messages.length || busy" @click="clearChat">清空对话</el-button>
           </div>
 
-          <div class="msg__content">
-            <div class="bubble">
-              <!-- 用户消息 -->
-              <template v-if="m.role === 'user'">
-                <div class="user-text">{{ m.text }}</div>
-              </template>
+          <div class="chat-body" ref="chatContainer">
+            <!-- 空状态：给几个能直接点的示例问题，比一句干巴巴的提示有用 -->
+            <div v-if="!messages.length" class="chat-empty">
+              <div class="chat-empty__icon">
+                <el-icon :size="34"><ChatDotRound /></el-icon>
+              </div>
+              <h4 class="chat-empty__title">问点什么？</h4>
+              <p class="chat-empty__desc">
+                agent 会自主调用工具排查，并给出带证据链的诊断报告。
+              </p>
+              <div class="chat-empty__chips">
+                <el-button
+                  v-for="q in SAMPLE_QUESTIONS"
+                  :key="q"
+                  size="small"
+                  round
+                  @click="askSample(q)"
+                >{{ q }}</el-button>
+              </div>
+            </div>
 
-              <!-- Agent 消息：推理步骤 + 最终报告 -->
-              <template v-else>
-                <div v-if="m.steps.length" class="steps">
-                  <div v-for="(s, i) in m.steps" :key="i" class="step-line" :class="{ 'step-line--done': s.done }">
-                    <el-icon class="step-line__icon">
-                      <Loading v-if="!s.done" class="is-loading" />
-                      <CircleCheck v-else />
-                    </el-icon>
-                    <span class="step-line__text">{{ s.text }}</span>
-                  </div>
-                </div>
+            <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="`msg--${m.role}`">
+              <div class="msg__avatar">
+                <el-icon v-if="m.role === 'agent'"><MagicStick /></el-icon>
+                <span v-else>{{ userInitial }}</span>
+              </div>
 
-                <div v-if="!m.report && !m.error && m.steps.length" class="thinking">
-                  <span class="thinking__dot"></span>
-                  <span class="thinking__dot"></span>
-                  <span class="thinking__dot"></span>
-                  <span class="thinking__text">正在推理…</span>
-                </div>
+              <div class="msg__content">
+                <div class="bubble">
+                  <!-- 用户消息 -->
+                  <template v-if="m.role === 'user'">
+                    <div class="user-text">{{ m.text }}</div>
+                  </template>
 
-                <div v-if="m.report" class="report" v-html="rendered(m.report)"></div>
-                <div v-if="m.error" class="error-text">
-                  <el-icon><WarningFilled /></el-icon>{{ m.error }}
+                  <!-- Agent 消息：推理步骤 + 最终报告 -->
+                  <template v-else>
+                    <div v-if="m.steps.length" class="steps">
+                      <div v-for="(s, i) in m.steps" :key="i" class="step-line" :class="{ 'step-line--done': s.done }">
+                        <el-icon class="step-line__icon">
+                          <Loading v-if="!s.done" class="is-loading" />
+                          <CircleCheck v-else />
+                        </el-icon>
+                        <span class="step-line__text">{{ s.text }}</span>
+                      </div>
+                    </div>
+
+                    <div v-if="!m.report && !m.error && m.steps.length" class="thinking">
+                      <span class="thinking__dot"></span>
+                      <span class="thinking__dot"></span>
+                      <span class="thinking__dot"></span>
+                      <span class="thinking__text">正在推理…</span>
+                    </div>
+
+                    <div v-if="m.report" class="report" v-html="rendered(m.report)"></div>
+                    <div v-if="m.error" class="error-text">
+                      <el-icon><WarningFilled /></el-icon>{{ m.error }}
+                    </div>
+                  </template>
                 </div>
-              </template>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
 
-      <div class="chat-input">
-        <el-input
-          v-model="input"
-          type="textarea"
-          :rows="1"
-          :autosize="{ minRows: 1, maxRows: 4 }"
-          placeholder="输入问题，如：nginx 为什么重启？（Enter 发送，Shift+Enter 换行）"
-          :disabled="busy"
-          resize="none"
-          @keydown.enter.exact.prevent="send"
-        />
-        <el-button
-          type="primary"
-          :icon="Promotion"
-          :disabled="busy || !input.trim()"
-          @click="send"
-        >
-          {{ busy ? '推理中' : '发送' }}
-        </el-button>
+          <div class="chat-input">
+            <el-input
+              v-model="input"
+              type="textarea"
+              :rows="1"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              placeholder="输入问题，如：nginx 为什么重启？（Enter 发送，Shift+Enter 换行）"
+              :disabled="busy"
+              resize="none"
+              @keydown.enter.exact.prevent="send"
+            />
+            <el-button
+              type="primary"
+              :icon="Promotion"
+              :disabled="busy || !input.trim()"
+              @click="send"
+            >
+              {{ busy ? '推理中' : '发送' }}
+            </el-button>
+          </div>
+        </el-card>
       </div>
-    </el-card>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { useUserStore } from '@/store/user'
 import { marked } from 'marked'
 import {
   ChatDotRound, Delete, Promotion, Loading, CircleCheck,
-  MagicStick, WarningFilled
+  MagicStick, WarningFilled, Plus
 } from '@element-plus/icons-vue'
+import { listSessions, createSession, getSessionMessages } from '@/api/chatops'
+import { ElMessage } from 'element-plus'
 
 const userStore = useUserStore()
 const input = ref('')
 const busy = ref(false)
 const messages = ref([])
 const chatContainer = ref(null)
+const sessions = ref([])
+const currentSessionId = ref('')
+const loadingSessions = ref(false)
 
 const userInitial = computed(() => (userStore.username || 'U').charAt(0).toUpperCase())
 
@@ -149,7 +191,93 @@ const scrollBottom = () => {
   })
 }
 
-// 把 SSE 事件帧解析成 {type, data}
+const formatTime = (value) => {
+  if (!value) return ''
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return String(value)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// SSE 事件体可能有两种结构：
+// - 旧后端：{ type, data }，data 为字符串
+// - 新后端错误：{ type, content }
+// 这里统一提取可渲染文本，避免 [object Object]。
+const eventText = (evt) => {
+  if (evt == null) return ''
+  if (typeof evt.content === 'string' && evt.content) return evt.content
+  if (typeof evt.data === 'string' && evt.data) return evt.data
+  if (evt.data && typeof evt.data === 'object') {
+    if (typeof evt.data.content === 'string') return evt.data.content
+    if (typeof evt.data.text === 'string') return evt.data.text
+    return JSON.stringify(evt.data)
+  }
+  if (typeof evt.message === 'string') return evt.message
+  return String(evt.content || evt.data || evt)
+}
+
+const toUserMessages = (rows) => {
+  return rows
+    .filter((m) => m && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({
+      role: m.role === 'assistant' ? 'agent' : 'user',
+      text: m.content,
+      steps: [],
+      report: m.role === 'assistant' ? m.content : '',
+      error: ''
+    }))
+}
+
+const loadSessions = async () => {
+  loadingSessions.value = true
+  try {
+    const res = await listSessions()
+    sessions.value = res.data || []
+  } catch (e) {
+    ElMessage.error('会话列表加载失败')
+  } finally {
+    loadingSessions.value = false
+  }
+}
+
+const loadSessionMessages = async (sessionId) => {
+  try {
+    const res = await getSessionMessages(sessionId)
+    const data = res.data || {}
+    messages.value = toUserMessages(data.messages || [])
+  } catch (e) {
+    messages.value = []
+    ElMessage.error('历史消息加载失败')
+  }
+}
+
+const createNewSession = async () => {
+  if (busy.value) return
+  try {
+    const res = await createSession()
+    const data = res.data || {}
+    currentSessionId.value = data.session_id
+    messages.value = []
+    await loadSessions()
+  } catch (e) {
+    ElMessage.error('新建对话失败')
+  }
+}
+
+const switchSession = async (sessionId) => {
+  if (busy.value || sessionId === currentSessionId.value) return
+  currentSessionId.value = sessionId
+  messages.value = []
+  await loadSessionMessages(sessionId)
+  scrollBottom()
+}
+
+const clearChat = () => {
+  if (busy.value) return
+  messages.value = []
+}
+
+// 把 SSE 事件帧解析成 {type, data/content}
 const parseFrame = (raw) => {
   if (!raw) return null
   try {
@@ -162,6 +290,18 @@ const parseFrame = (raw) => {
 const send = async () => {
   const text = input.value.trim()
   if (!text || busy.value) return
+
+  // 没有会话时先创建，保证每次追问都落到同一个 LangGraph thread_id
+  if (!currentSessionId.value) {
+    try {
+      const res = await createSession()
+      currentSessionId.value = (res.data || {}).session_id || `chat-${Date.now()}`
+      await loadSessions()
+    } catch (e) {
+      currentSessionId.value = `chat-${Date.now()}`
+    }
+  }
+
   input.value = ''
   busy.value = true
 
@@ -171,7 +311,9 @@ const send = async () => {
   messages.value.push(agentMsg)
   scrollBottom()
 
+  const sessionId = currentSessionId.value
   const taskId = `chatops-${Date.now()}`
+  let streamEnded = false
   try {
     // SSE 用 fetch + ReadableStream（EventSource 只支持 GET）
     const resp = await fetch('/api/chatops/stream', {
@@ -180,11 +322,10 @@ const send = async () => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${userStore.token}`
       },
-      body: JSON.stringify({ taskId, message: text })
+      body: JSON.stringify({ taskId, message: text, sessionId })
     })
     if (!resp.ok || !resp.body) {
       agentMsg.error = `请求失败: HTTP ${resp.status}`
-      busy.value = false
       return
     }
 
@@ -194,7 +335,10 @@ const send = async () => {
 
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        streamEnded = true
+        break
+      }
       buffer += decoder.decode(value, { stream: true })
       // SSE 帧以空行分隔
       const frames = buffer.split('\n\n')
@@ -204,20 +348,26 @@ const send = async () => {
           if (!line.startsWith('data:')) continue
           const evt = parseFrame(line.slice(5).trim())
           if (!evt) continue
+          const textValue = eventText(evt)
           if (evt.type === 'end') {
+            streamEnded = true
             agentMsg.steps.push({ done: true, text: '处理完成' })
           } else if (evt.type === 'error') {
-            agentMsg.error = evt.data
+            agentMsg.error = textValue || '大模型服务暂不可用'
+            streamEnded = true
           } else if (evt.type === 'final') {
-            agentMsg.report = evt.data
+            agentMsg.report = textValue
           } else if (evt.type === 'action' || evt.type === 'observation' || evt.type === 'thought') {
-            agentMsg.steps.push({ done: evt.type === 'observation', text: String(evt.data).slice(0, 200) })
-          } else {
-            agentMsg.steps.push({ done: false, text: String(evt.data).slice(0, 160) })
+            agentMsg.steps.push({ done: evt.type === 'observation', text: String(textValue).slice(0, 200) })
+          } else if (textValue) {
+            agentMsg.steps.push({ done: false, text: String(textValue).slice(0, 160) })
           }
           scrollBottom()
         }
       }
+    }
+    if (streamEnded) {
+      await refreshSessionMeta(sessionId)
     }
   } catch (e) {
     agentMsg.error = `连接失败: ${e.message}`
@@ -227,12 +377,147 @@ const send = async () => {
   }
 }
 
-const clearChat = () => {
-  messages.value = []
+const refreshSessionMeta = async (sessionId) => {
+  try {
+    const res = await listSessions()
+    sessions.value = res.data || []
+  } catch (e) {
+    // 列表刷新失败不阻塞对话
+  }
 }
+
+onMounted(async () => {
+  await loadSessions()
+  if (sessions.value.length) {
+    currentSessionId.value = sessions.value[0].session_id
+    await loadSessionMessages(currentSessionId.value)
+    scrollBottom()
+  } else {
+    // 首次进入自动创建一个会话，前端展示更像 DeepSeek 网页版
+    try {
+      const res = await createSession()
+      currentSessionId.value = (res.data || {}).session_id
+      await loadSessions()
+    } catch (e) {
+      currentSessionId.value = `chat-${Date.now()}`
+    }
+  }
+})
 </script>
 
 <style scoped>
+.chatops-page {
+  height: 100%;
+  min-height: 0;
+}
+
+.chatops-shell {
+  display: flex;
+  gap: 14px;
+  height: calc(100vh - 64px - var(--space-page) * 2);
+  min-height: 520px;
+}
+
+/* ---------- 会话侧边栏 ---------- */
+.session-sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-lg);
+  background: var(--c-surface);
+  overflow: hidden;
+}
+
+.session-sidebar__head {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--c-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.session-sidebar__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.session-sidebar__new {
+  min-width: 78px;
+}
+
+.session-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.session-item {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.session-item:hover {
+  background: var(--c-primary-soft);
+}
+
+.session-item--active {
+  background: var(--c-primary-soft);
+  border-color: var(--c-primary);
+}
+
+.session-item__title {
+  font-size: 13px;
+  color: var(--c-text);
+  line-height: 1.4;
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.session-item__meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--c-text-muted);
+}
+
+.session-empty,
+.session-loading {
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--c-text-muted);
+  font-size: 13px;
+}
+
+.session-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+/* ---------- 对话主体 ---------- */
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.chat-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .chat-head {
   display: flex;
   align-items: flex-start;
@@ -243,7 +528,7 @@ const clearChat = () => {
 }
 
 .chat-body {
-  height: calc(100vh - 64px - var(--space-page) * 2 - 230px);
+  height: calc(100% - 118px);
   min-height: 320px;
   overflow-y: auto;
   padding: 20px;
@@ -480,5 +765,31 @@ const clearChat = () => {
 
 .chat-input :deep(.el-textarea__inner) {
   border-radius: var(--radius-md);
+}
+
+@media (max-width: 768px) {
+  .chatops-shell {
+    flex-direction: column;
+  }
+
+  .session-sidebar {
+    width: 100%;
+    height: 150px;
+  }
+
+  .session-list {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+  }
+
+  .session-item {
+    min-width: 180px;
+    flex-shrink: 0;
+  }
+
+  .chat-main {
+    min-height: 0;
+  }
 }
 </style>

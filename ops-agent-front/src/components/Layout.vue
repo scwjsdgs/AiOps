@@ -134,7 +134,14 @@ const menuGroups = [
     title: '工具',
     items: [
       { path: '/chatops', label: 'ChatOps', icon: ChatDotRound },
-      { path: '/tools', label: '工具管理', icon: Tools }
+      { path: '/tools', label: '工具管理', icon: Tools },
+      { path: '/root-cause', label: '根因图谱', icon: Connection }
+    ]
+  },
+  {
+    title: '治理',
+    items: [
+      { path: '/audit', label: '安全审计', icon: Stamp }
     ]
   }
 ]
@@ -149,7 +156,9 @@ const TITLE_MAP = {
   '/tasks': '任务管理',
   '/tools': '工具管理',
   '/realtime': '实时监控',
-  '/chatops': 'ChatOps 交互诊断'
+  '/chatops': 'ChatOps 交互诊断',
+  '/audit': '安全审计',
+  '/root-cause': '根因图谱'
 }
 const currentTitle = computed(() => TITLE_MAP[route.path] || '页面')
 
