@@ -120,7 +120,11 @@ Dashboard 统计：最近 N 天每日分级计数 + 级别分布 + 状态计数�
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | `/api/approvals` | GET | 拉取审批单，支持 `status` 过滤 |
-| `/api/approvals/{requestId}/decision` | POST | 提交审批决策 `{ approved, note }`，由 JWT 校验用户 |
+| `/api/approvals/{requestId}/decision` | POST | 提交审批决策 `{ approved, note }`，由 JWT 校验用户；成功后 Java 异步通知 Python 恢复 LangGraph |
+
+LangGraph 审批流程：执行 Agent 写操作前调用 `interrupt()` 把图挂起，审批页决定后
+Java `/api/approvals/{id}/decision` 更新审批单并调用 Python `/api/agent/resume/{taskId}`，
+Python 用 `Command(resume=...)` 恢复图并继续执行/报告。
 
 ## 工具
 
@@ -166,9 +170,41 @@ curl -s -X POST localhost:8081/api/tools/execute -H "Authorization: Bearer $TOKE
 |------|------|------|
 | `/api/agent/callback/step` | POST | AI 大脑回传推理步骤，存入任务 agentSteps 并 WebSocket 推送 |
 | `/api/agent/callback/tool` | POST | AI 大脑请求执行工具 |
-| `/api/agent/callback/complete` | POST | AI 大脑回传最终报告，任务终态落库并回写告警状态 |
+| `/api/agent/callback/complete/{taskId}` | POST | AI 大脑回传最终报告，任务终态落库并回写告警状态 |
+| `/api/agent/resume/{taskId}` | POST | Python 侧接口：Java 审批决定后恢复 `interrupt()` 挂起的 LangGraph 图。需 `X-Internal-Token`，Body 为 `{ requestId, approved, note }`；`requestId` 必须匹配当前挂起审批单，否则 400 |
 
 所有 AI 回调需携带 `X-Internal-Token`（与 `aiops-agent/.env` 的 `JAVA_INTERNAL_TOKEN` 一致）。
+
+## 环境隔离与智能分析
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/api/environment` | GET | 当前平台命名空间与隔离模式 |
+| `/api/intelligence/root-cause-graph` | GET | 告警根因传播链图谱，支持 `deployment` / `limit` |
+| `/api/intelligence/similar-tasks` | GET | 历史相似故障推荐，支持 `deployment` / `keyword` / `limit` |
+| `/api/intelligence/chaos/run` | POST | 触发混沌评测并写入审计 |
+
+## RAG / 成本 / 混沌（Java 代理 Python）
+
+前端统一通过 JWT 访问 Java，Java 使用 `X-Internal-Token` 转发 Python，内部密钥不出 Java。
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/api/rag/knowledge/overview` | GET | 知识库概览与文档清单 |
+| `/api/rag/knowledge/documents` | GET | 文档列表 |
+| `/api/rag/knowledge/detail` | GET | 单文档详情（`source`） |
+| `/api/rag/knowledge/audit` | GET | 知识库操作审计（`limit` 默认 200） |
+| `/api/rag/knowledge/upload` | POST | 上传 SOP 文档并增量入库 |
+| `/api/rag/knowledge/rollback` | POST | 版本回滚 |
+| `/api/rag/knowledge/quality` | POST | 更新质量评分 |
+| `/api/rag/knowledge/rebuild` | POST | 重建向量库 |
+| `/api/rag/knowledge/delete` | POST | 删除文档（`source`） |
+| `/api/rag/knowledge/retry` | POST | 重试失败上传任务 |
+| `/api/rag/evaluate` | POST | RAG 分层评测 |
+| `/api/rag/debug` | POST | RAG 检索阶段调试 |
+| `/api/llm/cost` | GET | LLM Token / 成本 / 缓存 / 预算统计 |
+| `/api/chaos/run` | GET | 混沌评测（RAG 降级场景） |
+| `/api/chaos/adversarial` | GET | 提示注入 / 伪造报告对抗测试 |
 
 ## WebSocket
 
@@ -182,6 +218,6 @@ curl -s -X POST localhost:8081/api/tools/execute -H "Authorization: Bearer $TOKE
 2. **内部通信**：AI 大脑回调 `/api/agent/callback/**` 必须携带 `X-Internal-Token`。
 3. **Webhook 自身认证**：Alertmanager Webhook 不走 JWT，走 `X-Webhook-Token`，可在 `application.yml` 关闭（仅开发调试）。可选 HMAC 签名校验。
 4. **工具白名单**：LLM 仅能调用 `opsagent.tools.agent-exposed` 列表，`generic_command` 不暴露给 AI，但可在 `/api/tools/execute` 手工使用。
-5. **防重复执行**：ReAct 循环非幂等，Python 侧 `_inflight` 注册表 + Java 侧 409 去重双层互锁。重启、扩容等操作不做自动重试。
+5. **防重复执行**：LangGraph 图非幂等，Python 侧 Checkpointer 按 taskId 互锁（本地 SqliteSaver / 生产 Redis，接口一致）+ Java 侧 409 去重双层互锁。重启、扩容等操作不做自动重试。
 
 令牌需在 `ops_agent/.env.example`、application.yml 与 `aiops-agent/.env` 中保持一致。

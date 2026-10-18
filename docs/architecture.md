@@ -7,8 +7,8 @@ AIOps 平台由三层组成：
 | 层级 | 组件 | 职责 |
 |------|------|------|
 | 前端层 | Vue 3 + Pinia + Element Plus | 可视化运维大盘、告警列表、任务监控、审批、工具演练、实时推理流 |
-| 后端层 | Java (Spring Boot WebFlux) | 告警接入、任务调度、工具执行（K8s/SSH）、鉴权、WebSocket 推送 |
-| AI 层 | Python (FastAPI + LangChain) | ReAct 推理循环、根因定位、修复建议、RAG 知识库检索 |
+| 后端层 | Java (Spring Boot WebFlux) | 告警接入、任务调度、工具执行（K8s/SSH/K8s Pod 日志）、鉴权、WebSocket 推送 |
+| AI 层 | Python (FastAPI + LangGraph) | Multi-Agent 状态图、根因定位、修复执行、RAG 知识库检索 |
 
 ## 调用链路
 
@@ -29,26 +29,59 @@ sequenceDiagram
     H->>J: POST /api/alerts
     J->>J: 幂等去重(Redis) + 标准化
     J->>AI: POST /api/agent/start (fire-and-forget, 202)
-    AI->>AI: ReAct 多轮推理
+    AI->>AI: LangGraph Multi-Agent 状态图
     AI->>J: POST /api/agent/callback/tool (执行工具)
     J->>K8s: 查询状态 / 日志 / 事件 / 执行重启扩缩容回滚
     K8s-->>J: 工具结果
     AI->>J: POST /api/agent/callback/step (推理步骤)
     J-->>Front: WebSocket 推送
+    Front->>J: POST /api/approvals/{id}/decision (人工审批)
+    J->>AI: POST /api/agent/resume/{taskId} (恢复 interrupt 挂起)
     AI->>J: POST /api/agent/callback/complete (最终报告)
     J->>J: 任务终态 + 回写告警状态
 ```
+
+## LangGraph Multi-Agent 状态图
+
+```mermaid
+flowchart LR
+    START([告警 / ChatOps]) --> SUP[Supervisor Agent<br>拆解任务 / 路由]
+    SUP -->|diagnostic| DIA[诊断 Agent<br>只读：状态 / 日志 / 事件 / 指标 / 影响面]
+    DIA --> SUP
+    SUP -->|executor| EXE[执行 Agent<br>K8s 写操作]
+    EXE -->|interrupt| HITL[人工审批<br>/api/approvals/{id}/decision]
+    HITL -->|resume| EXE
+    EXE --> DIA
+    DIA --> SUP
+    SUP -->|reporter| REP[报告 Agent<br>只汇总证据防幻觉]
+    REP --> END([最终报告])
+```
+
+全局 `AgentState` 必须跨节点共享的字段：
+
+| 字段 | 说明 |
+|------|------|
+| `messages` | LangChain 消息历史，节点间通过 reducer 追加 |
+| `evidence` | 诊断 Agent 收集的只读证据 |
+| `root_cause` | 根因结论 |
+| `impact_summary` | 影响面：流量入口 / 是否断流 / 异常实例数 |
+| `approval_status` | `none / pending / approved / rejected / timeout` |
+| `approval_request` | 审批操作 / 理由 / requestId |
+| `execution_results` | 执行 Agent 的真实写操作结果 |
+| `retry_count` | 收敛控制，替代单层 8 轮计数 |
+| `report` | 报告 Agent 最终输出 |
 
 ## 模块说明
 
 ### AI 大脑（aiops-agent）
 
 - 基于 FastAPI 暴露 HTTP 接口，启动时挂定时巡检协程（每天 8:00 全服务健康检查）。
-- 使用 LangChain ReAct Agent 做多轮推理（默认上限 8 轮，受 `AGENT_MAX_ITERATIONS` 控制）。
-- 支持 10 个工具：知识库检索、服务状态查询、日志分析、Pod 事件查询、Prometheus 指标查询、影响面分析、重启/清缓存、扩缩容、回滚、人工审批。
-- RAG 检索已升级为工业级流水线：Query 润色（qwen-turbo 口语改写）→ BM25 关键词 + Chroma 向量双路召回 → RRF 粗排 → Rerank 精排 Top3（DashScope gte-rerank，失败自动降级）。embedding 走阿里云百炼原生接口（`DASHSCOPE_API_KEY`），与 DeepSeek 对话模型相互独立；知识库不可用时自动降级工具，不阻断主链路。
+- 使用 LangGraph Multi-Agent 状态图编排：Supervisor（任务拆解与路由）→ 诊断子图（只读排查）→ 执行子图（写操作+审批）→ 报告子图（防幻觉汇总），三个 Worker 均为独立 StateGraph 子图。条件边与 `iteration_count` 替代手写 while 循环；`AGENT_MAX_ITERATIONS` 保留为 Worker 内部步数兜底。
+- 全局 `AgentState` 跨节点共享：`messages`、`evidence`、`root_cause`、`impact_summary`、`approval_status`、`execution_results`、`retry_count`、`pod_diagnoses`、`report` 等。
+- LangGraph Checkpointer：`agents/graph/checkpointer.py` 将 checkpoint 持久化。本地开发因缺少 RedisSearch 模块使用 `SqliteSaver`，生产环境配置为 Redis Checkpointer，两者接口一致，支撑 `interrupt()` 审批挂起与进程重启后恢复。
+- RAG 检索已升级为工业级流水线：Query 润色（DeepSeek 口语改写）→ BM25 关键词 + Chroma 向量双路召回 → RRF 粗排 → Rerank 精排 Top3（DashScope gte-rerank，失败自动降级）。embedding 走阿里云百炼原生接口（`DASHSCOPE_API_KEY`），与 DeepSeek 对话/润色/评测模型相互独立；知识库不可用时自动降级工具，不阻断主链路。
 - 检索评估：`rag/retrieval_eval.py` 基于 30 条“问题 + 标准文档”测试集计算 Hit@K / MRR；当前实测 Hit@3=0.87、MRR=0.79（Rerank/润色关闭的基线链路）。
-- AgentState：每个任务在 ReAct 循环中维护 core_intent/current_subtask/pending_tools/completed_steps，审批挂起前序列化为 JSON 存 Redis，支撑断点续传和审批恢复。
+- 人工审批：执行子图在写操作前调用 `interrupt()`，图挂起在 Checkpointer（本地 SqliteSaver / 生产 Redis）；Java 审批决定后回调 `/api/agent/resume` 恢复，不再阻塞 55 秒。
 - Reflection：最终报告会结合检索/工具观测原文重新审阅（`PASS`/指出幻觉），只有 PASS 才回调 Java；失败会尝试修订或按 FAILED 回传。
 - LangFuse：通过 `observability/langfuse_client.py` 接入 LangChain Callback，追踪 LLM 调用、Token 消耗、工具执行与慢 Trace 瀑布图。
 
@@ -67,7 +100,7 @@ sequenceDiagram
 ### 前端（ops-agent-front）
 
 - Vue 3 + Vite + Pinia + Element Plus。
-- 路由：Dashboard（/dashboard）、告警（/alerts）、审批（/approvals）、任务（/tasks）、工具（/tools）、实时监控（/realtime）。
+- 路由：Dashboard（/dashboard）、告警（/alerts）、审批（/approvals）、任务（/tasks）、工具（/tools）、实时监控（/realtime）、安全审计（/audit）、根因图谱（/root-cause）。
 - 通过 WebSocket 订阅 `taskId`，实时展示推理步骤（一键 AI 诊断 / 实时监控页）。
 - Dashboard 展示最近 7 天告警趋势、级别分布（ECharts）、集群状态（K8s Deployment 实况）、
   指标大盘与**基线偏离卡片**（当前值 vs 学习到的 μ±3σ 区间）。

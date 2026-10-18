@@ -101,7 +101,7 @@ curl -i -X POST http://localhost:8081/api/alerts/webhook \
 
 验证要点：
 
-- firing 后 202 返回，MySQL `alerts` 表新增一条 PENDING 且带 `fingerprint` 字段，Redis `task:*` 新建，AI 侧开始 ReAct 推理。
+- firing 后 202 返回，MySQL `alerts` 表新增一条 PENDING 且带 `fingerprint` 字段，Redis `task:*` 新建，AI 侧开始 LangGraph Multi-Agent 推理。
 - 重复 firing 不新建任务，metric `agent.webhook.duplicate` 增加。
 - resolved 后告警状态变为 `RESOLVED`，任务不受影响。
 - 前端 Dashboard 一键 AI 诊断会实时推送推理步骤；高危操作时审批链路出现待审批单。

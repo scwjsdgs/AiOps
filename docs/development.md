@@ -75,7 +75,7 @@ npm run dev
 
 ```
 AiOps/
-├── aiops-agent/       # Python AI 大脑 (FastAPI + LangChain ReAct + RAG)
+├── aiops-agent/       # Python AI 大脑 (FastAPI + LangGraph Multi-Agent + RAG)
 ├── ops_agent/         # Java 后端 (Spring Boot WebFlux + Webhook + WebSocket)
 ├── ops-agent-front/   # Vue 3 前端 (Pinia + Element Plus)
 ├── docs/              # 项目文档
@@ -89,5 +89,5 @@ AiOps/
 
 - Java 后端日志级别：`com.opsagent` 为 DEBUG，可在 `application.yml` 调整。
 - Webhook Token 测试：默认 `dev-webhook-token`，如需关闭校验可将 `opsagent.webhook.token` 置空（仅开发调试）。
-- AI 推理控制：`AGENT_MAX_ITERATIONS=8`、`AGENT_TIMEOUT_SECONDS=300` 于 `aiops-agent/.env` 调整。
-- 审批模式：`opsagent.approval.mode=manual|auto` 于 `application.yml` 控制。
+- AI 编排控制：`AGENT_MAX_ITERATIONS=8`、`AGENT_TIMEOUT_SECONDS=300`、`GRAPH_CHECKPOINT_TTL_SECONDS=86400` 于 `aiops-agent/.env` 调整。
+- 审批模式：`opsagent.approval.mode=manual|auto` 于 `application.yml` 控制；manual 模式下 LangGraph `interrupt()` 挂起等待，Java 审批后 `/api/agent/resume` 恢复。
