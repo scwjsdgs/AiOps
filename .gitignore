@@ -108,6 +108,9 @@ Desktop.ini
 
 # 向量数据库与本地缓存
 *.sqlite3
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 chroma_db/
 memory_storage/
 aiops-agent/memory_storage/
