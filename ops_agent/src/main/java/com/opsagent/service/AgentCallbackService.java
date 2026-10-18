@@ -39,7 +39,17 @@ public class AgentCallbackService {
     @CircuitBreaker(name = "agentCall")
     @Bulkhead(name = "agentCall", type = Bulkhead.Type.SEMAPHORE)
     public Mono<Void> notifyAgent(String taskId, String alertDescription) {
-        AgentRequest request = new AgentRequest(taskId, alertDescription);
+        return notifyAgent(taskId, alertDescription, "告警分析", "unknown");
+    }
+
+    /**
+     * @param title / serviceName 用于给 Python 侧 Agent 传递真实告警上下文。
+     *               旧入口只传 description，Python 会把服务名写成 unknown，
+     *               导致大模型反复分析根本不存在的服务，并污染案例库。
+     */
+    public Mono<Void> notifyAgent(String taskId, String alertDescription,
+                                  String title, String serviceName) {
+        AgentRequest request = new AgentRequest(taskId, alertDescription, title, serviceName);
         return webClient.post()
                 .uri(agentBaseUrl + "/api/agent/start")
                 .bodyValue(request)
@@ -196,9 +206,13 @@ public class AgentCallbackService {
     static class AgentRequest {
         public String taskId;
         public String description;
-        public AgentRequest(String taskId, String description) {
+        public String title;
+        public String serviceName;
+        public AgentRequest(String taskId, String description, String title, String serviceName) {
             this.taskId = taskId;
             this.description = description;
+            this.title = title;
+            this.serviceName = serviceName;
         }
     }
 }

@@ -4,6 +4,7 @@ import com.opsagent.dto.ApiResponse;
 import com.opsagent.dto.AuthRequest;
 import com.opsagent.dto.AuthResponse;
 import com.opsagent.entity.User;
+import com.opsagent.service.AuditLogService;
 import com.opsagent.service.UserService;
 import com.opsagent.utils.JwtUtil;
 import lombok.RequiredArgsConstructor;
@@ -27,6 +28,8 @@ public class AuthController {
 
     private final JwtUtil jwtUtil;
 
+    private final AuditLogService auditLogService;
+
     /**
      * 登录。
      *
@@ -39,17 +42,24 @@ public class AuthController {
      */
     @PostMapping("/login")
     public Mono<ResponseEntity<ApiResponse<AuthResponse>>> login(@RequestBody AuthRequest request) {
-        Optional<User> userOpt = userService.findByUsername(request.getUsername());
+        String username = request == null ? null : request.getUsername();
+        Optional<User> userOpt = userService.findByUsername(username);
         if (userOpt.isEmpty()) {
+            auditLogService.record("LOGIN", "login_failed", username == null ? "unknown" : username,
+                    "REST", "", "账号不存在或密码错误", false);
             return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                     .body(ApiResponse.error(401, "Invalid username or password")));
         }
         User user = userOpt.get();
         if (!userService.checkPassword(request.getPassword(), user.getPassword())) {
+            auditLogService.record("LOGIN", "login_failed", username,
+                    "REST", "", "密码错误", false);
             return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                     .body(ApiResponse.error(401, "Invalid username or password")));
         }
         String token = jwtUtil.generateToken(user.getUsername());
+        auditLogService.record("LOGIN", "login_success", user.getUsername(),
+                "REST", "", "登录成功 role=" + user.getRole(), true);
         return Mono.just(ResponseEntity.ok(
                 ApiResponse.success(new AuthResponse(token, user.getUsername(), user.getRole()))));
     }

@@ -4,6 +4,7 @@ import com.opsagent.exception.BusinessException;
 import com.opsagent.model.ToolExecutionRequest;
 import com.opsagent.model.ToolExecutionResult;
 import com.opsagent.tool.*;
+import com.opsagent.service.AuditLogService;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
@@ -36,8 +37,15 @@ public class ToolRegistryService {
     private final QueryMetricsTool queryMetricsTool;
     private final PodEventsTool podEventsTool;
     private final QueryImpactTool queryImpactTool;
+    private final ConfigRollbackTool configRollbackTool;
+    private final TrafficSwitchTool trafficSwitchTool;
+    private final PodEvictTool podEvictTool;
+    private final NodeDrainTool nodeDrainTool;
+    private final ConnectionPoolTool connectionPoolTool;
+    private final HealthCheckParamTool healthCheckParamTool;
 
     private final MeterRegistry meterRegistry;
+    private final AuditLogService auditLogService;
 
     @Value("${opsagent.tools.agent-exposed:}")
     private String agentExposedConfig;
@@ -63,6 +71,12 @@ public class ToolRegistryService {
         registerTool(queryMetricsTool);
         registerTool(podEventsTool);
         registerTool(queryImpactTool);
+        registerTool(configRollbackTool);
+        registerTool(trafficSwitchTool);
+        registerTool(podEvictTool);
+        registerTool(nodeDrainTool);
+        registerTool(connectionPoolTool);
+        registerTool(healthCheckParamTool);
 
         agentExposed = Arrays.stream(agentExposedConfig.split(","))
                 .map(String::trim)
@@ -107,10 +121,14 @@ public class ToolRegistryService {
         Tool tool = tools.get(request.getToolName());
         if (tool == null) {
             toolFailureCounter.increment();
+            auditLogService.record("TOOL", "tool_execute", forAgent ? "python-agent" : "user",
+                    forAgent ? "INTERNAL" : "REST", request.getToolName(), "tool not found", false);
             return failure("Tool not found: " + request.getToolName());
         }
         if (forAgent && !agentExposed.contains(tool.getName())) {
             toolFailureCounter.increment();
+            auditLogService.record("TOOL", "tool_execute", "python-agent",
+                    "INTERNAL", tool.getName(), "tool not allowed for agent", false);
             return failure("tool not allowed for agent: " + tool.getName());
         }
 
@@ -127,6 +145,9 @@ public class ToolRegistryService {
             } else {
                 toolFailureCounter.increment();
             }
+            auditLogService.record("TOOL", "tool_execute", forAgent ? "python-agent" : "user",
+                    forAgent ? "INTERNAL" : "REST", request.getToolName() + " context=" + request.getContextId(),
+                    result.getMessage(), result.isSuccess());
             return result;
         } catch (Exception e) {
             // 工具内部抛异常不能往外扔：抛出去会变成 HTTP 500，

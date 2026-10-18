@@ -18,12 +18,12 @@ import java.util.UUID;
  * agent 原来那句"模拟批准"等价，区别是这条批准现在有据可查。
  *
  * mode=manual：写入待审批队列（Redis + MySQL）并 WebSocket 推给前端，
- * 然后阻塞等待人工决定（上限 opsagent.approval.wait-timeout，默认 55s）。
- * 超时视为未批准——人工审批不能无限期挂住自动流程，agent 会拿到
- * "审批超时"转而走稳妥路径。等待逻辑全在本工具内（boundedElastic 线程），
- * Python 侧仍是同步 HTTP 调用，无需感知。
+ * 然后立即返回。LangGraph 图此刻在 Python 侧 interrupt() 挂起在 Redis
+ * Checkpointer；Java 侧不再阻塞任何线程，人工决定由审批页
+ * /api/approvals/{id}/decision 提交后，Java 异步回调 Python
+ * /api/agent/resume 恢复图。
  *
- * Python 侧读 data.approved / data.mode / data.requestId / data.note。
+ * Python 侧读 data.approved / data.pending / data.mode / data.requestId / data.note。
  */
 @Slf4j
 @Component
@@ -78,13 +78,12 @@ public class HumanApprovalTool implements Tool {
             return Tool.success("Auto-approved (mode=auto, requestId=" + requestId + "): " + operation, data, start);
         }
 
-        // manual 模式：写入待审批队列（Redis + MySQL）并推给前端，然后阻塞等待人工决定。
-        // 这里运行在 boundedElastic 线程上（AgentCallbackService.executeTool 已调度），
-        // 阻塞等待不影响 Netty event loop。等待上限必须小于 Python 侧
-        // HTTP_READ_TIMEOUT(60s)，否则审批还没结束 Python 先超时了。
-        ApprovalService.Decision decision;
+        // manual 模式：写入待审批队列（Redis + MySQL）并推给前端，然后立即返回。
+        // LangGraph 图此刻在 Python 侧 interrupt() 挂起；Java 侧不再阻塞线程，
+        // 55 秒超时不再是线程轮询。真正恢复由 /api/approvals/{id}/decision 回调
+        // /api/agent/resume 完成。
         try {
-            decision = approvalService.createAndAwait(requestId, operation, reason, taskId);
+            approvalService.submitPending(requestId, operation, reason, taskId);
         } catch (Exception e) {
             // 审批服务挂了不能让 agent 拿到"已批准"：降级为未批准并如实说明
             log.error("审批服务异常 requestId={} operation={}", requestId, operation, e);
@@ -99,28 +98,16 @@ public class HumanApprovalTool implements Tool {
         }
 
         Map<String, Object> data = new LinkedHashMap<>();
-        data.put("approved", decision.approved());
+        data.put("approved", false);
+        data.put("pending", true);
         data.put("requestId", requestId);
-        data.put("mode", decision.mode());
+        data.put("mode", "manual");
         data.put("operation", operation);
         data.put("reason", reason);
-        if (decision.note() != null && !decision.note().isBlank()) {
-            data.put("note", decision.note());
-        }
+        data.put("timeoutSeconds", waitTimeoutSeconds);
 
-        String message;
-        if (decision.approved()) {
-            message = "Approved by human (mode=" + decision.mode() + ", requestId=" + requestId + "): " + operation;
-        } else if ("timeout".equals(decision.mode())) {
-            message = "Approval timed out after " + waitTimeoutSeconds + "s (requestId=" + requestId + "): " + operation
-                    + " — proceed with the safe alternative, do NOT execute the high-risk operation.";
-        } else {
-            message = "Rejected by human (requestId=" + requestId + "): " + operation
-                    + (decision.note() != null && !decision.note().isBlank() ? " — reason: " + decision.note() : "");
-        }
-
-        // 请求本身送达成功即 success=true；批没批由 data.approved 表达。
-        // 两者混在一起会让 Python 侧无法区分"审批被拒"和"审批服务挂了"。
+        String message = "Approval requested (requestId=" + requestId + ", LangGraph 已挂起): " + operation;
+        // 请求本身送达成功即 success=true；批没批由 data.approved/data.pending 表达。
         return Tool.success(message, data, start);
     }
 }

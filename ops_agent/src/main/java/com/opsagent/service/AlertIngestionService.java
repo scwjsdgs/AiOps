@@ -59,9 +59,11 @@ public class AlertIngestionService {
         alertReceivedCounter.increment();
         log.info("Received alert: {}", alert);
 
-        // 1. 保存告警到数据库
+        // 1. 保存告警到数据库（Webhook 通道设置的 fingerprint 也要原样落库，
+        //    否则 resolved 事件只能靠随机 UUID 匹配，永远对不上）
         AlertEntity entity = new AlertEntity();
         BeanUtils.copyProperties(alert, entity);
+        entity.setFingerprint(alert.getFingerprint());
         entity.setId(alert.getId() != null ? alert.getId() : UUID.randomUUID().toString());
         entity.setCreateTime(LocalDateTime.now());
         entity.setProcessed(false);
@@ -76,7 +78,10 @@ public class AlertIngestionService {
                     // 触发分析前先把影响面算出来，拼进任务输入 ——
                     // 让 LLM 一开始就知道「这影响了哪些流量入口、是否已断流」，
                     // 而不必自己从零散日志里猜。查不到就退回原始描述，不阻塞建任务。
-                    String input = enrichWithImpact(alert.getDescription());
+                    String input = enrichWithImpact(
+                            alert.getDescription() != null && !alert.getDescription().isBlank()
+                                    ? alert.getDescription()
+                                    : "服务 " + safeServiceName(alert.getServiceName()) + " 发生告警：" + alert.getTitle());
                     return taskScheduler.createTask("ROOT_CAUSE_ANALYSIS", alertId, input)
                             .flatMap(task -> {
                                 // 这里是 fire-and-forget，绝不能等 agent 跑完。
@@ -85,7 +90,8 @@ public class AlertIngestionService {
                                 // 注意必须用 onComplete 回调标记 ANALYZING：notifyAgent
                                 // 返回 Mono<Void>，完成时不发任何元素，两参数 subscribe
                                 // 的 onNext 永远不会触发，告警会永远停在 PENDING。
-                                agentCallbackService.notifyAgent(task.getId(), input)
+                                agentCallbackService.notifyAgent(task.getId(), input,
+                                alert.getTitle(), alert.getServiceName())
                                         .subscribe(
                                                 null,
                                                 e -> markAlert(alertId, "FAILED", false),
@@ -121,6 +127,10 @@ public class AlertIngestionService {
             log.warn("影响面注入失败（不影响分析）: {}", e.getMessage());
             return description;
         }
+    }
+
+    private String safeServiceName(String name) {
+        return name == null || name.isBlank() ? "unknown" : name;
     }
 
     private void markAlert(String alertId, String status, boolean processed) {

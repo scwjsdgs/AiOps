@@ -47,4 +47,10 @@ public class Alert {
     private LocalDateTime timestamp;
     private boolean processed;
     private String status;      // PENDING, ANALYZING, RESOLVED, FAILED
+
+    /**
+     * Alertmanager webhook 的幂等指纹（默认 alertname|instance|severity）。
+     * 独立于其它监控来源，只有 Webhook 通道会设置。
+     */
+    private String fingerprint;
 }

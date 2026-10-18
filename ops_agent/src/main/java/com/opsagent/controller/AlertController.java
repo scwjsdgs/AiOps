@@ -5,6 +5,7 @@ import com.opsagent.entity.AlertEntity;
 import com.opsagent.model.Alert;
 import com.opsagent.repository.AlertRepository;
 import com.opsagent.service.AlertIngestionService;
+import com.opsagent.service.AuditLogService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -29,10 +30,15 @@ public class AlertController {
 
     private final AlertIngestionService alertIngestionService;
     private final AlertRepository alertRepository;
+    private final AuditLogService auditLogService;
 
     @PostMapping
     public Mono<ApiResponse<Void>> receiveAlert(@RequestBody Alert alert) {
-        return alertIngestionService.processAlert(alert)
+        return Mono.fromRunnable(() -> auditLogService.record("ALERT", "alert_received",
+                        "user", "REST",
+                        alert == null ? "" : alert.getServiceName(),
+                        alert == null ? "" : alert.getTitle(), true))
+                .then(alertIngestionService.processAlert(alert))
                 .then(Mono.just(ApiResponse.success(null)));
     }
 

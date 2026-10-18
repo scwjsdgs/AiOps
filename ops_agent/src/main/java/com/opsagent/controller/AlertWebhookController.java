@@ -3,6 +3,7 @@ package com.opsagent.controller;
 import com.opsagent.model.AlertmanagerWebhookPayload;
 import com.opsagent.service.AlertWebhookService;
 import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
+import com.opsagent.service.AuditLogService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,6 +27,7 @@ import reactor.core.publisher.Mono;
 public class AlertWebhookController {
 
     private final AlertWebhookService webhookService;
+    private final AuditLogService auditLogService;
 
     @Value("${opsagent.webhook.token:}")
     private String webhookToken;
@@ -69,6 +71,10 @@ public class AlertWebhookController {
             }
             if (!authenticated) {
                 log.warn("Webhook token 校验失败");
+                auditLogService.record("ALERT", "webhook_auth_failed", "unknown",
+                        "WEBHOOK", payload == null || payload.getAlerts() == null ? ""
+                                : payload.getAlerts().size() + " alerts",
+                        "Webhook token 校验失败", false);
                 return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).build());
             }
         }
@@ -87,9 +93,16 @@ public class AlertWebhookController {
         // 校验通过立即返回 202。processWebhook 内部自己切到 boundedElastic，
         // 这里不能用 fromRunnable 包它 —— 那样会在 runnable 线程里二次 subscribe，
         // 请求线程不等处理完就返回 202 与"异步处理"的语义冲突（变相同步）。
+        auditLogService.record("ALERT", "webhook_received", "alertmanager",
+                "WEBHOOK", payload == null ? "" : (payload.getAlerts() == null ? "0" : payload.getAlerts().size()) + " alerts",
+                "Alertmanager Webhook 已接收", true);
         webhookService.processWebhook(payload).subscribe(
                 null,
-                e -> log.error("Webhook 异步处理失败", e)
+                e -> {
+                    log.error("Webhook 异步处理失败", e);
+                    auditLogService.record("ALERT", "webhook_processing_failed", "alertmanager",
+                            "WEBHOOK", "", e.getMessage(), false);
+                }
         );
         return Mono.just(ResponseEntity.accepted().build());
     }

@@ -5,12 +5,16 @@ import com.opsagent.exception.BusinessException;
 import com.opsagent.repository.ApprovalRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.scheduler.Schedulers;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
@@ -37,23 +41,27 @@ public class ApprovalService {
     private final StringRedisTemplate redisTemplate;
     private final ApprovalRepository approvalRepository;
     private final WebSocketPushService webSocketPushService;
+    private final WebClient webClient;
 
     private static final String PREFIX = "approval:";
 
     /**
-     * 等待人工决定的超时（毫秒）。从配置读取，默认 55 秒。
-     *
-     * 原本硬编码 55_000，与 HumanApprovalTool 的 opsagent.approval.wait-timeout
-     * 各管各的——改了配置只影响提示语，实际等待时长纹丝不动，是个隐蔽的坑。
-     * 注意上限：必须小于 Python 侧 HTTP_READ_TIMEOUT（默认 60s），
-     * 否则审批还没结束，Python 先超时了。
+     * Python Agent 地址：审批决定后异步回调恢复 LangGraph 断点。
+     * 原实现由 HumanApprovalTool 在工具内阻塞等待 55 秒，这里改为
+     * 提交后立即返回，真正的人工决定由 /api/approvals/{id}/decision 触发。
+     */
+    @Value("${opsagent.agent.url:http://localhost:5000}")
+    private String agentBaseUrl;
+
+    @Value("${opsagent.internal.token:dev-internal-token}")
+    private String internalToken;
+
+    /**
+     * 等待人工决定的超时（秒）。保留配置兼容；新 LangGraph 审批不再阻塞，
+     * 超时只作为审批列表/前端展示的提示，不用于线程轮询。
      */
     @org.springframework.beans.factory.annotation.Value("${opsagent.approval.wait-timeout:55}")
     private long waitTimeoutSeconds;
-
-    private long waitTimeoutMs() {
-        return waitTimeoutSeconds * 1000;
-    }
 
     /** 仅用于内部决策返回。record 的访问器是 approved()/mode()/note()，与调用端 HumanApprovalTool 的写法一致。 */
     public record Decision(boolean approved, String mode, String note) {
@@ -88,11 +96,14 @@ public class ApprovalService {
     }
 
     /**
-     * 创建审批请求并同步等待结果。
-     * @throws Exception 任务运行过程中若出现异常（如 Redis 连接中断）将被抛出，工具层会捕获并返回 failure。
+     * 创建审批请求并立即返回，不再阻塞等待人工决定。
+     *
+     * LangGraph 的 interrupt() 会把 Python 图挂起在 Redis Checkpointer；
+     * Java 侧只需要落一条 PENDING 审批单、推给前端，等待
+     * /api/approvals/{id}/decision 回调恢复。55 秒超时不再阻塞线程，
+     * 人工审批可以持续到 24h Checkpointer TTL 内任意时间。
      */
-    public Decision createAndAwait(String requestId, String operation, String reason, String taskId) throws Exception {
-        // 1. 写入临时 PENDING 记录
+    public void submitPending(String requestId, String operation, String reason, String taskId) {
         Approval approval = new Approval();
         approval.setRequestId(requestId);
         approval.setOperation(operation);
@@ -102,8 +113,7 @@ public class ApprovalService {
         approval.setCreatedAt(LocalDateTime.now());
         approvalRepository.save(approval);
 
-        // 2. 写入 Redis，等待前端或 WebSocket 触发变更
-        Map<String, Object> redisMap = new HashMap<>();
+        Map<String, String> redisMap = new HashMap<>();
         redisMap.put("status", "PENDING");
         redisMap.put("mode", "manual");
         redisMap.put("operation", operation);
@@ -112,53 +122,21 @@ public class ApprovalService {
         redisMap.put("createdAt", LocalDateTime.now().toString());
         redisTemplate.opsForHash().putAll(PREFIX + requestId, redisMap);
 
-        // 3. 通过 WebSocket 广播"有审批待处理"。
-        // 改造前这里只写了 Redis/MySQL 就进入阻塞等待——前端完全不知道有审批在等，
-        // 55 秒后被系统判超时拒绝。整个 manual 模式因此形同虚设。
-        // 审批事件与任务事件共用同一条 WS 通道（/ws/agent），前端按 type 区分。
         pushApprovalEvent("APPROVAL_PENDING", requestId, operation, reason, taskId,
-                "待审批：" + operation + "（" + waitTimeoutSeconds + " 秒内未处理将自动拒绝）");
+                "待审批：" + operation + "（LangGraph 已挂起等待人工决定）");
+    }
 
-        long start = System.currentTimeMillis();
-        while (true) {
-            Object statusObj = redisTemplate.opsForHash().get(PREFIX + requestId, "status");
-            if (statusObj != null && !"PENDING".equals(statusObj)) {
-                String status = statusObj.toString();
-                boolean approved = "APPROVED".equalsIgnoreCase(status);
-                String mode = status.toLowerCase();
-                String note = (String) redisTemplate.opsForHash().get(PREFIX + requestId, "note");
-
-                // 更新 MySQL 记录
-                Optional<Approval> opt = approvalRepository.findById(requestId);
-                Approval a = opt.orElse(approval);
-                a.setStatus(status);
-                a.setDecidedBy("human");
-                a.setDecisionNote(note);
-                a.setDecidedAt(LocalDateTime.now());
-                approvalRepository.save(a);
-
-                return new Decision(approved, mode, note);
-            }
-
-            if (System.currentTimeMillis() - start > waitTimeoutMs()) {
-                // 超时处理
-                redisTemplate.opsForHash().put(PREFIX + requestId, "status", "TIMEOUT");
-                redisTemplate.opsForHash().put(PREFIX + requestId, "note", "Waiting approval timed out");
-                Approval a = approvalRepository.findById(requestId).orElse(approval);
-                a.setStatus("TIMEOUT");
-                a.setDecidedBy("system");
-                a.setDecisionNote("Waiting approval timed out");
-                a.setDecidedAt(LocalDateTime.now());
-                approvalRepository.save(a);
-                // 超时也要广播：前端弹窗需要自动关闭，否则用户会对着一个
-                // 早已失效的审批框点"批准"，拿到"已处理，不允许重复审批"的报错。
-                pushApprovalEvent("APPROVAL_TIMEOUT", requestId, operation, reason, taskId,
-                        "审批超时：" + operation + "（" + waitTimeoutSeconds + " 秒内无人处理，已自动拒绝）");
-                return new Decision(false, "timeout", "Waiting approval timed out");
-            }
-
-            Thread.sleep(200); // 防止占用 CPU
-        }
+    /**
+     * 创建审批请求并同步等待结果（旧协议兼容）。
+     *
+     * 新 LangGraph 流程不再调用这个方法；保留它是为了兼容
+     * 工具页/旧代码直接调用 request_human_approval 的同步语义，
+     * 但内部也改为非阻塞提交 + 返回一个仍在等待的决定。
+     * 真正的恢复由 LangGraph resume 完成。
+     */
+    public Decision createAndAwait(String requestId, String operation, String reason, String taskId) throws Exception {
+        submitPending(requestId, operation, reason, taskId);
+        return new Decision(false, "pending", "审批请求已提交，LangGraph 图已挂起等待人工决定");
     }
 
     /**
@@ -175,8 +153,7 @@ public class ApprovalService {
     }
 
     /**
-     * 前端审批决定：更新 MySQL 终态 + 同步 Redis 状态。
-     * createAndAwait 的等待循环每 200ms 轮询 Redis，这里写入后等待方最多 200ms 内拿到结果。
+     * 前端审批决定：更新 MySQL 终态 + 同步 Redis 状态，并通知 Python 恢复 LangGraph。
      *
      * @throws BusinessException 单号不存在或已决（不允许重复审批）时抛出
      */
@@ -194,7 +171,7 @@ public class ApprovalService {
         approval.setDecidedAt(LocalDateTime.now());
         approvalRepository.save(approval);
 
-        // 同步 Redis：让 createAndAwait 的等待循环立刻感知决定
+        // 同步 Redis：供前端列表/审批页读取终态
         Map<String, String> update = new HashMap<>();
         update.put("status", status);
         if (note != null) {
@@ -207,8 +184,48 @@ public class ApprovalService {
                 approval.getReason(), approval.getTaskId(),
                 "APPROVAL_DECIDED:" + requestId + ":" + status);
 
+        // LangGraph 恢复：审批决定后异步通知 Python resume 被 interrupt() 挂起的图。
+        // 回调失败不能影响审批本身；Python 侧 Checkpointer 仍在，可手工重放恢复。
+        notifyAgentResume(requestId, approved, note, approval.getTaskId());
+
         log.info("审批单 {} 已由 {} {}: {}", requestId, decidedBy, status, note);
         return new Decision(approved, status.toLowerCase(), note);
+    }
+
+    /**
+     * 审批决定后通知 Python LangGraph 恢复执行。
+     *
+     * 原实现靠 Java 工具阻塞 55 秒轮询 Redis；现在 Python 图在审批节点
+     * interrupt() 挂起，这里通过 HTTP 调用 /api/agent/resume 传入决定。
+     * 这是异步增强：网络失败时审批仍已终态落库，运维可重放/人工介入。
+     */
+    private void notifyAgentResume(String requestId, boolean approved, String note, String taskId) {
+        if (taskId == null || taskId.isBlank()) {
+            return;
+        }
+        try {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("requestId", requestId);
+            payload.put("approved", approved);
+            payload.put("note", note == null ? "" : note);
+
+            webClient.post()
+                    .uri(agentBaseUrl + "/api/agent/resume/" + taskId)
+                    .header("X-Internal-Token", internalToken)
+                    .bodyValue(payload)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .timeout(Duration.ofSeconds(60))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .doOnSuccess(v -> log.info("已通知 Python 恢复任务 taskId={} requestId={} approved={}",
+                            taskId, requestId, approved))
+                    .doOnError(e -> log.warn("通知 Python 恢复失败 taskId={} requestId={}: {}",
+                            taskId, requestId, e.getMessage()))
+                    .subscribe();
+        } catch (Exception e) {
+            // 审批决定本身已经落库；通知失败只记日志，运维可重放/人工介入
+            log.warn("通知 Python 恢复异常 taskId={} requestId={}: {}", taskId, requestId, e.getMessage());
+        }
     }
 
     /**

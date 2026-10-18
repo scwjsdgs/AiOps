@@ -1,6 +1,9 @@
 package com.opsagent.tool;
 
 import com.opsagent.model.ToolExecutionResult;
+import com.opsagent.service.KubernetesToolClientHolder;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.apps.Deployment;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -32,6 +35,7 @@ public class QueryLogTool implements Tool {
             Pattern.compile("^[A-Za-z0-9_.:\\- ]{1,64}$");
 
     private final SshCommandRunner sshRunner;
+    private final KubernetesToolClientHolder k8sHolder;
 
     @Value("${opsagent.log.local-dir:}")
     private String localDir;
@@ -39,8 +43,9 @@ public class QueryLogTool implements Tool {
     @Value("${opsagent.log.unit-pattern:%s}")
     private String unitPattern;
 
-    public QueryLogTool(SshCommandRunner sshRunner) {
+    public QueryLogTool(SshCommandRunner sshRunner, KubernetesToolClientHolder k8sHolder) {
         this.sshRunner = sshRunner;
+        this.k8sHolder = k8sHolder;
     }
 
     @Override
@@ -89,6 +94,12 @@ public class QueryLogTool implements Tool {
             ToolExecutionResult local = readLocal(service, lines, keyword, command, start);
             if (local != null) {
                 return local;
+            }
+            // 本地目录也没有时，直接走 Kubernetes Pod 日志，这是 Linux/容器部署环境
+            // 最常见且最真实的日志源，也避免 Agent 因 SSH 不通就拿不到日志。
+            ToolExecutionResult k8sLogs = readKubernetesPodLog(service, lines, keyword, start);
+            if (k8sLogs != null) {
+                return k8sLogs;
             }
             if (result.timedOut()) {
                 return Tool.failure("日志查询超时（service=" + service + "）", start);
@@ -146,6 +157,50 @@ public class QueryLogTool implements Tool {
             }
             return buildSuccess(content, service, lines, keyword, command, "local:" + file, start);
         } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** K8s Pod 日志降级：SSH/本地都不可用时，直接拉取 Deployment 第一个 Pod 的日志。 */
+    private ToolExecutionResult readKubernetesPodLog(String service, int lines,
+                                                     String keyword, long start) {
+        try {
+            String namespace = k8sHolder.namespace();
+            Deployment deployment = k8sHolder.client().apps().deployments()
+                    .inNamespace(namespace).withName(service).get();
+            if (deployment == null) {
+                return null;
+            }
+            List<Pod> pods = k8sHolder.client().pods().inNamespace(namespace)
+                    .withLabelSelector(deployment.getSpec().getSelector())
+                    .list().getItems();
+            if (pods.isEmpty()) {
+                return null;
+            }
+            Pod pod = pods.get(0);
+            String podName = pod.getMetadata().getName();
+            String containerName = deployment.getSpec().getTemplate().getSpec().getContainers()
+                    .get(0).getName();
+            String raw = k8sHolder.client().pods().inNamespace(namespace)
+                    .withName(podName)
+                    .inContainer(containerName)
+                    .tailingLines(Math.max(1, lines))
+                    .getLog();
+            if (raw == null) {
+                return null;
+            }
+            String keywordLower = keyword.toLowerCase();
+            String filtered = raw.lines()
+                    .filter(line -> line.toLowerCase().contains(keywordLower))
+                    .collect(Collectors.joining("\n"));
+            if (filtered.isBlank()) {
+                filtered = raw;
+            }
+            return buildSuccess(filtered, service, lines, keyword,
+                    "kubectl logs -n " + namespace + " " + podName + " -c " + containerName,
+                    "k8s-pod-logs", start);
+        } catch (Exception e) {
+            // K8s 降级也失败时保持原有失败语义，让 LLM 如实看到不可用
             return null;
         }
     }

@@ -138,6 +138,7 @@ public class AlertWebhookService {
             return;
         }
         alert.setId(alert.getId() != null ? alert.getId() : UUID.randomUUID().toString());
+        alert.setFingerprint(fingerprint);
 
         // ----- 告警降噪（聚合窗口） -----
         // 同一 Pod/服务的多条告警（alertname 不同、fingerprint 不同）在窗口内到达时，
@@ -276,7 +277,10 @@ public class AlertWebhookService {
         if (!severity.matches("CRITICAL|WARNING|INFO")) {
             severity = "WARNING";
         }
-        String serviceName = labels.getOrDefault("service", labels.getOrDefault("service_name", "unknown"));
+        String serviceName = labels.getOrDefault("service",
+                labels.getOrDefault("service_name",
+                        labels.getOrDefault("namespace",
+                                labels.getOrDefault("job", labels.getOrDefault("alertname", "unknown")))));
         String instance = labels.getOrDefault("instance", labels.getOrDefault("job", "unknown"));
         String host = labels.getOrDefault("instance", labels.getOrDefault("host", "unknown"));
 

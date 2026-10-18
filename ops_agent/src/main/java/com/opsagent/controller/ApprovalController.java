@@ -3,6 +3,7 @@ package com.opsagent.controller;
 import com.opsagent.dto.ApiResponse;
 import com.opsagent.entity.Approval;
 import com.opsagent.service.ApprovalService;
+import com.opsagent.service.AuditLogService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -29,6 +30,7 @@ import java.util.Map;
 public class ApprovalController {
 
     private final ApprovalService approvalService;
+    private final AuditLogService auditLogService;
 
     @GetMapping
     public Mono<ApiResponse<Map<String, Object>>> list(
@@ -63,6 +65,8 @@ public class ApprovalController {
                     data.put("approved", d.approved());
                     data.put("mode", d.mode());
                     data.put("note", d.note());
+                    auditLogService.record("APPROVAL", "decision", decidedBy, "REST",
+                            requestId, "approved=" + d.approved() + " mode=" + d.mode(), true);
                     return ResponseEntity.ok(ApiResponse.success((Object) data));
                 })
                 // decide 里要写 MySQL + Redis，都是阻塞 IO
