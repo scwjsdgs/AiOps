@@ -6,6 +6,7 @@ from models import Alert
 from config import config
 from agents.graph.graph import run_agent_for_alert, run_react_loop, resume_graph
 from services.callback import callback_service
+from services.kafka_callback import kafka_tool_callback
 from services.task_runner import submit
 from rag.vector_store import get_vector_store
 import logging
@@ -540,7 +541,8 @@ async def scheduled_health_check():
 
 @app.on_event("startup")
 async def startup_event():
-    """服务启动时，启动后台巡检任务，并预热向量库"""
+    """服务启动时，启动 Kafka 工具通道、后台巡检任务，并预热向量库"""
+    await kafka_tool_callback.start()
     if config.HEALTH_CHECK_ENABLED:
         asyncio.create_task(scheduled_health_check())
         interval = config.HEALTH_CHECK_INTERVAL_HOURS
@@ -551,6 +553,12 @@ async def startup_event():
         logger.info("主动巡检已通过 HEALTH_CHECK_ENABLED=false 关闭。")
     # 预热向量库：放到线程里跑，不阻塞启动；失败只记日志（get_vector_store 内部已兜底）
     asyncio.create_task(asyncio.to_thread(get_vector_store))
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("服务关闭，停止 Kafka 工具调用通道")
+    await kafka_tool_callback.stop()
 
 
 @app.post("/api/agent/trigger_health_check")

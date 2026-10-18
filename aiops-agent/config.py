@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     # 因为这些接口能触发 restart/scale 等真实运维操作，不能裸奔放行。
     JAVA_INTERNAL_TOKEN: str = os.getenv("JAVA_INTERNAL_TOKEN", "dev-internal-token")
 
+    # 工具调用链双通道模式：kafka 默认走 Kafka 事件驱动，http 走原 HTTP 回调。
+    # Kafka 启动失败、发送失败、结果等待超时等异常会自动降级回 HTTP，
+    # 不会因为消息队列故障阻塞整个 AI 推理链。
+    CALLBACK_MODE: str = os.getenv("CALLBACK_MODE", "kafka").lower()
+    KAFKA_BOOTSTRAP_SERVERS: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    KAFKA_TOOL_REQUEST_TOPIC: str = os.getenv("KAFKA_TOOL_REQUEST_TOPIC", "agent-tool-request")
+    KAFKA_TOOL_RESULT_TOPIC: str = os.getenv("KAFKA_TOOL_RESULT_TOPIC", "agent-tool-result")
+    KAFKA_GROUP_ID: str = os.getenv("KAFKA_GROUP_ID", "aiops-python-tool-group")
+    # Kafka 请求发出后等待结果的超时（秒）。超时后视为异常并自动回退 HTTP。
+    KAFKA_CALLBACK_TIMEOUT_SECONDS: float = float(os.getenv("KAFKA_CALLBACK_TIMEOUT_SECONDS", "30"))
+
     # LangFuse 可观测性（默认关闭，配置齐了自动启用）
     LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
     LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "http://localhost:3030")

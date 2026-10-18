@@ -34,7 +34,7 @@ spring:
       timeout: 5000ms
 
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     consumer:
       group-id: agent-group
       auto-offset-reset: earliest
@@ -44,9 +44,9 @@ spring:
         reconnect.backoff.ms: 1000
         spring.json.trusted.packages: "*"
 
-  # 已删除 spring.webflux.base-path: /api
-  # 它会把整个 HTTP 管道包进 ContextPathCompositeHandler，导致所有 Controller
-  # 实际变成 /api/api/xxx，而且 WebSocket 握手和 /actuator/health 会直接 404。
+# 已删除 spring.webflux.base-path: /api
+# 它会把整个 HTTP 管道包进 ContextPathCompositeHandler，导致所有 Controller
+# 实际变成 /api/api/xxx，而且 WebSocket 握手和 /actuator/health 会直接 404。
 
 jwt:
   # HS256 要求密钥至少 256 bit（32 字节）。原值 your-256-bit-secret-for-jwt
@@ -56,6 +56,12 @@ jwt:
 
 # 自定义配置
 opsagent:
+  # Kafka 工具调用事件驱动通道（与 HTTP 回调并存，双通道兼容）
+  # - agent-tool-request：Python 生产请求，ops_agent 消费并执行工具
+  # - agent-tool-result ：ops_agent 生产执行结果，Python 按 requestId 精确匹配
+  kafka:
+    tool-request-topic: ${KAFKA_TOOL_REQUEST_TOPIC:agent-tool-request}
+    tool-result-topic: ${KAFKA_TOOL_RESULT_TOPIC:agent-tool-result}
   internal:
     # Python agent 回调 /api/agent/callback/** 时必须携带 X-Internal-Token，
     # 与 aiops-agent/.env 的 JAVA_INTERNAL_TOKEN 保持一致。

@@ -31,7 +31,7 @@
 
 ## 2. 整体架构
 
-平台由三个核心模块与七类外部依赖组成。前端通过 HTTP 和 WebSocket 与 Java 中枢通信，Java 异步触发 Python 的 LangGraph 状态图，Python 通过 HTTP 回调 Java 执行工具并回传结果；人工审批由 `interrupt()` 挂起图，Java 审批决定后回调 Python 恢复执行。
+平台由三个核心模块与七类外部依赖组成。前端通过 HTTP 和 WebSocket 与 Java 中枢通信，Java 异步触发 Python 的 LangGraph 状态图，Python 执行工具时优先走 Kafka 事件驱动（`agent-tool-request` / `agent-tool-result`），异常自动降级回 HTTP 回调；人工审批由 `interrupt()` 挂起图，Java 审批决定后回调 Python 恢复执行。
 
 ```mermaid
 flowchart TB
@@ -53,7 +53,7 @@ flowchart TB
 
     subgraph 外部依赖
         DB[(MySQL)]
-        R[(Redis<br>AOF 持久化 / LangGraph Checkpointer<br>本地 SqliteSaver，生产 Redis)]
+        R[(Redis<br>AOF 持久化 / LangGraph Checkpointer<br>本地 SqliteSaver / 生产 Redis)]
         K8S[Kubernetes kind]
         LLM[DeepSeek 对话]
         EMB[DashScope embedding]
@@ -69,7 +69,7 @@ flowchart TB
     J -->|异步触发| P
     F -->|审批决定| J
     J -->|resume 恢复图| P
-    P -->|HTTP 回调| J
+    P -->|Kafka 工具调用优先<br>HTTP 回调降级| J
     P <-->|interrupt 挂起 / resume| R
     J --> DB
     J --> R
@@ -86,10 +86,10 @@ flowchart TB
 ```mermaid
 flowchart LR
     START([Prometheus 告警 / ChatOps]) --> SUP[Supervisor Agent<br>拆解任务 / 路由]
-    SUP -->|diagnostic| DIA[诊断 Agent<br>只读：状态/日志/事件/指标/影响面]
+    SUP -->|diagnostic| DIA[诊断 Agent<br>只读：状态 / 日志 / 事件 / 指标 / 影响面]
     DIA --> SUP
     SUP -->|executor| EXE[执行 Agent<br>K8s 写操作]
-    EXE -->|人工审批 interrupt<hr>Checkpointer 挂起<br>本地 SqliteSaver / 生产 Redis| HITL[审批页 /api/approvals/<br>{requestId}/decision]
+    EXE -->|人工审批 interrupt| HITL[审批页 /api/approvals/requestId/decision<br>Checkpointer 挂起<br>本地 SqliteSaver / 生产 Redis]
     HITL -->|yes / no| EXE
     EXE --> DIA
     DIA --> SUP
@@ -111,7 +111,7 @@ flowchart LR
 |------|---------|-----------|------|
 | MySQL | ops_agent | JDBC | 告警、审批、用户数据持久化 |
 | Redis | ops_agent | Redis 读写 | 任务状态、审批队列、Webhook 幂等去重、降噪聚合窗口 |
-| Kafka | ops_agent | 消费 | 消费 `alerts` topic 接入告警消息 |
+| Kafka | ops_agent / aiops-agent | 生产 / 消费 | 消费 `alerts` topic 接入告警消息；`agent-tool-request` / `agent-tool-result` 承载 Kafka 工具调用双通道 |
 | Kubernetes | ops_agent | fabric8 / Kubernetes API | kind 集群，执行真实运维操作 |
 | LLM | aiops-agent | OpenAI 兼容 API | DeepSeek 对话/润色/评测（`LLM_BASE_URL`） |
 | Embedding | aiops-agent | DashScope 原生接口 | 阿里云百炼 text-embedding，RAG 建库/检索（`DASHSCOPE_API_KEY`） |
@@ -275,9 +275,10 @@ bash apply-monitoring.sh
 #   kubectl port-forward -n monitoring svc/alertmanager 9093:9093
 
 # 3. 配置环境变量
-cp ops_agent/.env.example ops_agent/.env        # 修改 MYSQL_*、OPSAGENT_INTERNAL_TOKEN、OPSAGENT_WEBHOOK_TOKEN
-cp aiops-agent/.env.example aiops-agent/.env    # 修改 LLM_API_KEY、DASHSCOPE_API_KEY（RAG embedding）、JAVA_INTERNAL_TOKEN 等
+cp ops_agent/.env.example ops_agent/.env        # 修改 MYSQL_*、OPSAGENT_INTERNAL_TOKEN、OPSAGENT_WEBHOOK_TOKEN、KAFKA_*
+cp aiops-agent/.env.example aiops-agent/.env    # 修改 LLM_API_KEY、DASHSCOPE_API_KEY（RAG embedding）、JAVA_INTERNAL_TOKEN、CALLBACK_MODE、KAFKA_*
 # 前端已有 .env（VITE_API_BASE_URL=/api、VITE_WS_BASE_URL=ws://localhost:8081）
+# CALLBACK_MODE=kafka 为工具调用默认事件驱动通道，置为 http 可直接切回原 HTTP 回调
 
 # 4. 启动 Java 后端（Windows PowerShell 需先 $env:MYSQL_PASSWORD="你的密码"）
 cd ops_agent
@@ -332,7 +333,7 @@ python aiops-agent/load_test.py --count 100
 | /api/chatops/sessions | POST | 新建 ChatOps 会话 |
 | /api/chatops/sessions | GET | 当前用户历史会话列表 |
 | /api/chatops/sessions/{sessionId} | GET | 拉取指定会话历史消息（Java 校验归属后从 Python Checkpointer 读取） |
-| /api/agent/callback/* | POST | Python AI 大脑回调接口（step/tool/complete/{taskId}，X-Internal-Token） |
+| /api/agent/callback/* | POST | Python AI 大脑 HTTP 回调接口（step/tool/complete/{taskId}，X-Internal-Token；工具执行作为 Kafka 降级通道保留） |
 | /api/agent/resume/{taskId} | POST | Java 审批决定后恢复 LangGraph interrupt 挂起任务 |
 | /api/agent/trigger_health_check | POST | 手动触发全服务健康巡检 |
 | /api/audit | GET | 安全审计日志（登录/告警/工具/审批/回放） |
@@ -377,7 +378,7 @@ AI 大脑与后端的通信使用 X-Internal-Token 进行身份校验，令牌�
 系统提示词要求：定位根因后必须产出影响面（受影响的 Service、是否断流、异常实例数）；若已断流需在报告开头显著提示。
 告警触发分析时，Java 侧也会把影响面摘要预先追加进任务输入，Supervisor 一开始就知道影响范围。
 
-****工具执行**：Python 回调 Java，Java 校验白名单后真实操作 K8s（fabric8）或查日志（SSH）。`query_log` 在 SSH/本地目录均不可用时，会自动降级到 Kubernetes Pod 日志（`k8s-pod-logs`），保证 Agent 在本地 kind 环境也能拿到真实日志。`generic_command`（任意 shell）保留但永不暴露给 LLM。
+****工具执行**：Python 优先通过 Kafka 事件驱动请求 Java（`agent-tool-request` / `agent-tool-result`，按 `requestId` 精确匹配），Kafka 异常自动降级为原 HTTP 回调 `/api/agent/callback/tool`。Java 校验白名单后真实操作 K8s（fabric8）或查日志（SSH）。`query_log` 在 SSH/本地目录均不可用时，会自动降级到 Kubernetes Pod 日志（`k8s-pod-logs`），保证 Agent 在本地 kind 环境也能拿到真实日志。`generic_command`（任意 shell）保留但永不暴露给 LLM。
 新增高危/变更类工具同样遵循「白名单 + 人工审批 + 审计」：`config_rollback`（Deployment rollout undo）、`traffic_switch`（Service selector 切换）、`pod_evict`（驱逐 Pod 重建）、`node_drain`（节点不可调度 + 确认后驱逐）、`adjust_connection_pool`（环境变量方式调整连接池）、`adjust_health_check`（探针参数调整）。这些工具默认不加入 agent 白名单，工具页显示「仅人工执行」；如确需 agent 自主调用，再显式追加到 `opsagent.tools.agent-exposed`。
 
 **人工审批**：执行 Agent 在写操作前调用 LangGraph `interrupt()` 挂起整张图，审批单经 WebSocket 广播给前端。人工决定后 Java 更新审批单并通过 `/api/agent/resume` 恢复图；拒绝或异常时不执行写操作。审批期间不占用 Java 线程，也没有 55 秒阻塞倒计时。

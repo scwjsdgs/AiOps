@@ -21,7 +21,7 @@ flowchart LR
     SUP -->|diagnostic| DIA[诊断 Agent<br>只读排查]
     DIA --> SUP
     SUP -->|executor| EXE[执行 Agent<br>K8s 写操作]
-    EXE -->|interrupt| HITL[人工审批<br>/api/approvals/{requestId}/decision]
+    EXE -->|interrupt| HITL[人工审批<br>/api/approvals/requestId/decision]
     HITL -->|resume / rejected| EXE
     EXE --> DIA
     DIA --> SUP

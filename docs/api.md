@@ -17,13 +17,19 @@
 | 上游服务异常 | **502** | 502 | Python agent / K8s 不可达 |
 | 服务端未知异常 | **500** | 500 | |
 
-**工具执行结果例外**：`/api/tools/execute` 与 `/api/agent/callback/tool` 对「工具执行失败」
-**始终返回 HTTP 200**，成败由 body 里的 `data.success` 表达。
+**工具执行结果例外**：`/api/tools/execute`、`/api/agent/callback/tool` 与 Kafka 工具结果
+消息对「工具执行失败」同样返回/表达成功，`data.success` / `success` 字段承载真实成败。
 
 这是刻意的设计而非疏漏：Python agent 侧用 `resp.raise_for_status()` 调工具，
 若把「工具执行失败」映射成非 2xx，Agent 会在异常分支里丢掉结构化的失败信息
 （`message` / `data`），无法如实告诉 LLM「重启失败了，原因是什么」。
-HTTP 语义上「请求成功送达」与「被请求的操作成功执行」本就是两件事。
+HTTP 语义上「请求成功送达」与「被请求的操作成功执行」本就是两件事；
+Kafka 通道同样把「消息已送达」与「操作成功」分开。
+
+**工具调用链双通道**：Python 默认 `CALLBACK_MODE=kafka`，请求发往
+`agent-tool-request`，Java `KafkaToolCallbackService` 执行后回传 `agent-tool-result`
+（携带 `requestId` / `taskId` / `success` / `message` / `data`）；
+Kafka 异常自动降级为 HTTP `/api/agent/callback/tool`，该接口长期保留。
 
 ## 告警接入
 
@@ -169,7 +175,8 @@ curl -s -X POST localhost:8081/api/tools/execute -H "Authorization: Bearer $TOKE
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | `/api/agent/callback/step` | POST | AI 大脑回传推理步骤，存入任务 agentSteps 并 WebSocket 推送 |
-| `/api/agent/callback/tool` | POST | AI 大脑请求执行工具 |
+| Kafka `agent-tool-request` / `agent-tool-result` | 生产 / 消费 | AI 大脑工具执行事件驱动通道（默认） |
+| `/api/agent/callback/tool` | POST | AI 大脑请求执行工具（HTTP 降级通道，保留） |
 | `/api/agent/callback/complete/{taskId}` | POST | AI 大脑回传最终报告，任务终态落库并回写告警状态 |
 | `/api/agent/resume/{taskId}` | POST | Python 侧接口：Java 审批决定后恢复 `interrupt()` 挂起的 LangGraph 图。需 `X-Internal-Token`，Body 为 `{ requestId, approved, note }`；`requestId` 必须匹配当前挂起审批单，否则 400 |
 

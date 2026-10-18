@@ -6,6 +6,7 @@ import httpx
 
 from models import AgentMessage, ToolExecutionRequest, ToolExecutionResult
 from config import config
+from services.kafka_callback import kafka_tool_callback
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,15 @@ class CallbackService:
                 logger.warning(f"回调失败（可忽略）: {e}")
 
     async def execute_tool(self, task_id: str, tool_name: str, parameters: dict) -> ToolExecutionResult:
+        # 双通道兼容：默认 Kafka，异常自动降级回原 HTTP 回调。
+        if config.CALLBACK_MODE == "kafka":
+            try:
+                return await kafka_tool_callback.execute_tool(task_id, tool_name, parameters)
+            except Exception as e:
+                logger.warning(f"Kafka 工具调用失败 tool={tool_name} task={task_id}，降级 HTTP: {e}")
+        return await self._execute_tool_http(task_id, tool_name, parameters)
+
+    async def _execute_tool_http(self, task_id: str, tool_name: str, parameters: dict) -> ToolExecutionResult:
         request = ToolExecutionRequest(
             toolName=tool_name,
             parameters=parameters,
