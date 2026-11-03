@@ -198,6 +198,9 @@
           <el-icon><DataLine /></el-icon>指标大盘
           <el-tag v-if="metricsConnected" size="small" type="success" effect="light">Prometheus 已连接</el-tag>
           <el-tag v-else size="small" type="danger" effect="light">Prometheus 不可用</el-tag>
+          <el-tag v-if="metricsConnected && !cadvisorConnected" size="small" type="warning" effect="light">
+            容器指标未采集（cAdvisor down）
+          </el-tag>
         </h3>
         <el-button size="small" :icon="Refresh" @click="loadMetrics" :loading="metricsLoading">刷新指标</el-button>
       </div>
@@ -425,6 +428,7 @@ const cpuChartRef = ref(null)
 const memChartRef = ref(null)
 const replicasChartRef = ref(null)
 const metricsConnected = ref(false)
+const cadvisorConnected = ref(false)
 const metricsLoading = ref(false)
 let cpuChart = null
 let memChart = null
@@ -436,6 +440,7 @@ const loadMetrics = async () => {
     const res = await getClusterMetrics()
     const data = res.data || {}
     metricsConnected.value = !!data.connected
+    cadvisorConnected.value = !!data.cadvisorConnected
     renderMetrics(data)
   } catch {
     metricsConnected.value = false

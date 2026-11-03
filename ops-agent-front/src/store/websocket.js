@@ -116,6 +116,8 @@ export const useWebSocketStore = defineStore('websocket', {
         this.pendingApproval = {
           requestId: field('requestId'),
           operation: field('operation'),
+          serviceName: field('serviceName'),
+          namespace: field('namespace'),
           reason: field('reason'),
           timeout: parseInt(field('timeout') || '55', 10),
           text,

@@ -31,6 +31,9 @@ public class JwtAuthenticationFilter implements WebFilter {
     @Value("${opsagent.internal.token:dev-internal-token}")
     private String internalToken;
 
+    @Value("${opsagent.webhook.docs.token:}")
+    private String docsWebhookToken;
+
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         String path = exchange.getRequest().getPath().pathWithinApplication().value();
@@ -76,6 +79,12 @@ public class JwtAuthenticationFilter implements WebFilter {
         // 5) Alertmanager Webhook：自身带 X-Webhook-Token 校验（Controller 内），
         //    这里放行路由，不校验 JWT（Alertmanager 无法携带 JWT）。
         if (path.equals("/api/alerts/webhook")) {
+            return chain.filter(exchange);
+        }
+
+        // 5.1) 文档系统 Webhook：自身带 X-Doc-Webhook-Token 校验（Controller 内），
+        //      这里只做最小放行，文档系统不持有 JWT。
+        if (path.equals("/api/rag/docs/webhook")) {
             return chain.filter(exchange);
         }
 

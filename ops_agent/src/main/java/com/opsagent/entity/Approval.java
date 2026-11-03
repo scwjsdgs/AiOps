@@ -3,6 +3,7 @@ package com.opsagent.entity;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -20,7 +21,12 @@ import java.time.LocalDateTime;
  * Python 侧通过 HumanApprovalTool 间接使用，前端审批页直接读写。
  */
 @Entity
-@Table(name = "approvals")
+@Table(name = "approvals", indexes = {
+        // 超时扫描按 (status, created_at) 过滤；审批页也按 status 分页。
+        // 加联合索引避免全表扫描拖垮超时扫描（原 scan-interval 10s 时高频调用）。
+        @Index(name = "idx_approvals_status_created_at", columnList = "status,created_at"),
+        @Index(name = "idx_approvals_created_at", columnList = "created_at")
+})
 @Data
 @NoArgsConstructor
 @AllArgsConstructor

@@ -155,9 +155,13 @@ def _get_bm25_index():
         metas = data.get("metadatas") or []
         if not docs:
             return None
-        corpus = [list(jieba.cut(d)) for d in docs]
+        # 软删除过滤：status=DISABLED 的 chunk 不参与 BM25 召回
+        filtered_docs, filtered_metas = _filter_disabled(docs, metas)
+        if not filtered_docs:
+            return None
+        corpus = [list(jieba.cut(d)) for d in filtered_docs]
         bm25 = BM25Okapi(corpus)
-        return (bm25, docs, metas)
+        return (bm25, filtered_docs, filtered_metas)
     except Exception as e:
         logger.warning(f"构建 BM25 索引失败：{e}")
         return None
@@ -193,17 +197,38 @@ def _bm25_search(query: str, k: int = 20):
 
 
 def _vector_search(query: str, k: int = 20):
-    """Chroma 向量召回，返回 [(content, metadata), ...]（已按相似度排序）。"""
+    """Chroma 向量召回，返回 [(content, metadata), ...]（已按相似度排序）。
+
+    软删除过滤交给数据库层：where={"status": {"$ne": "DISABLED"}}。
+    该语义对“没有 status 字段”的存量 chunk 也视为非 DISABLED，兼容旧数据。
+    """
     store = get_vector_store()
     if store is None:
         return []
     try:
-        docs = store.similarity_search_with_score(query, k=k)
+        docs = store.similarity_search_with_score(
+            query,
+            k=k,
+            filter={"status": {"$ne": "DISABLED"}},
+        )
         # docs 元素是 (Document, score)，score 越小越相似
         return [(d.page_content, d.metadata or {}, float(s)) for d, s in docs]
     except Exception as e:
         logger.warning(f"向量检索失败：{e}")
         return []
+
+
+def _filter_disabled(docs: list, metas: list) -> tuple:
+    """过滤软删除文档：metadata status=DISABLED 的 chunk 不进索引/召回。"""
+    if not docs or not metas:
+        return docs or [], metas or []
+    kept_docs, kept_metas = [], []
+    for d, m in zip(docs, metas):
+        if (m or {}).get("status") == "DISABLED":
+            continue
+        kept_docs.append(d)
+        kept_metas.append(m)
+    return kept_docs, kept_metas
 
 
 def _rrf_fuse(vector_results: list, bm25_results: list, k: int = 60, top_n: int = 20) -> list:
@@ -303,6 +328,13 @@ def hybrid_search(query: str, k: int = 3):
     bm25_results = _bm25_search(search_query, k=20) if config.RAG_BM25_ENABLED else []
     vector_results = _vector_search(search_query, k=20)
     logger.info(f"双路召回：向量 {len(vector_results)} 条 / BM25 {len(bm25_results)} 条")
+
+    # 软删除过滤后若某一路明显不足，打印诊断（向量库空/全被 DISABLED 时常见）。
+    if len(vector_results) < k or len(bm25_results) < k:
+        logger.info(
+            f"RAG 召回不足 k={k}：向量 {len(vector_results)} 条 / BM25 {len(bm25_results)} 条，"
+            "RRF 分数分布可能偏，由上层决定是否走无依据分支"
+        )
 
     # 3. RRF 融合粗排，取 Top20
     fused = _rrf_fuse(vector_results, bm25_results, k=config.RAG_RRF_K, top_n=20)

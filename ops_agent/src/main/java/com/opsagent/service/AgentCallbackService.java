@@ -29,6 +29,8 @@ public class AgentCallbackService {
     private final AlertRepository alertRepository;
     private final WebClient webClient;
     private final RecoveryVerificationService recoveryVerificationService;
+    private final AlertLifecycleService alertLifecycleService;
+    private final com.opsagent.repository.ApprovalRepository approvalRepository;
 
     @Value("${opsagent.agent.url:http://localhost:5000}")
     private String agentBaseUrl;
@@ -49,7 +51,15 @@ public class AgentCallbackService {
      */
     public Mono<Void> notifyAgent(String taskId, String alertDescription,
                                   String title, String serviceName) {
-        AgentRequest request = new AgentRequest(taskId, alertDescription, title, serviceName);
+        return notifyAgent(taskId, alertDescription, title, serviceName, false);
+    }
+
+    /**
+     * @param readonly 只读诊断：预测性预警等告警不触发高危 executor/审批。
+     */
+    public Mono<Void> notifyAgent(String taskId, String alertDescription,
+                                  String title, String serviceName, boolean readonly) {
+        AgentRequest request = new AgentRequest(taskId, alertDescription, title, serviceName, readonly);
         return webClient.post()
                 .uri(agentBaseUrl + "/api/agent/start")
                 .bodyValue(request)
@@ -117,6 +127,13 @@ public class AgentCallbackService {
      * @param status SUCCESS 或 FAILED。
      *               agent 侧推理失败时必须落 FAILED —— 原实现无论成败都写 SUCCESS，
      *               一个失败的分析在界面上看起来是"已完成"。
+     *
+     * 生产闭环（批准 → 验证 → 闭环）：
+     * agent 回传 SUCCESS **不代表**修复已闭环，只代表「执行完成」。这里把它改判为
+     * VERIFYING 并启动 5 分钟观察期；观察期结论由 RecoveryVerificationService 决定：
+     *   通过 → 任务/告警 SUCCESS/RESOLVED（真正闭环）
+     *   失败 → REGRESSED → 重试或耗尽（见 onVerificationRegressed）
+     * 非修复类任务（没有已批准审批单的纯诊断）保持原有语义，不进入验证轮次。
      */
     public Mono<Void> taskComplete(String taskId, String result, String status) {
         return taskScheduler.completeTask(taskId, result, status)
@@ -127,50 +144,61 @@ public class AgentCallbackService {
                 // 前瞻性增强：修复类任务成功收尾后进入回归观察期——「执行完」不等于
                 // 「修好了」，观察期内若故障复现将任务改判 REGRESSED 并重新触发分析。
                 // 这里只是登记观察（内部异步，立即返回），不阻塞回调本身。
+                //
+                // 无论任务最终 SUCCESS 还是 FAILED，只要是一次真实分析/修复尝试，
+                // 都要进入观察期：执行失败也可能是资源/网络瞬时抖动，观察期能继续
+                // 监控它是否自愈或在 5 分钟内复现。
                 .doOnSuccess(v -> scheduleRecoveryVerification(taskId, status))
                 .then();
     }
 
     /**
-     * 只对「成功收尾的根因分析任务」安排回归验证：失败任务没有可验证的修复动作，
-     * 巡检/报告类任务也没有明确的服务对象。
+     * 只要任务已经进入终态（SUCCESS 或 FAILED，且不是被人工拒绝）都安排回归验证。
+     * 失败任务同样需要观察：K8s 侧可能自愈，也可能持续崩溃，不能因为一次工具报错就放弃监控。
      */
     private void scheduleRecoveryVerification(String taskId, String status) {
-        if (!"SUCCESS".equals(status)) {
+        String upper = status == null ? "" : status.toUpperCase();
+        if ("REJECTED".equals(upper) || "PENDING".equals(upper) || "RUNNING".equals(upper)) {
             return;
         }
         try {
             recoveryVerificationService.scheduleVerification(taskId);
         } catch (Exception e) {
-            // 回归验证是增强能力，绝不能因为它让任务完成回调失败
+            // 回归验证是增强能力，绝不能让它让任务完成回调失败
             log.warn("登记回归验证失败 taskId={}: {}", taskId, e.getMessage());
         }
     }
 
     /**
-     * 任务终态 -> 告警终态：SUCCESS 映射 RESOLVED，FAILED 映射 FAILED。
+     * 任务终态 -> 告警终态：
+     * - SUCCESS 且该任务确实获得过人工批准（有 APPROVED 审批单）→ VERIFYING
+     *   （修复已执行但未证明恢复，进入 5 分钟验证期，由观察期决出 SUCCESS/RESOLVED）
+     * - SUCCESS 但只是只读诊断 → RESOLVED（没有写操作，无需验证轮次）
+     * - REGRESSED / FAILED → PENDING（未解决，交由重试预算裁决）
+     * - REJECTED（人工拒绝审批）→ REJECTED，不映射成红色 FAILED
      * 任务可能没有关联告警（手动巡检、工具演练），查不到 alertId 就跳过。
      */
     private Mono<Void> markRelatedAlert(String taskId, String taskStatus) {
-        String alertStatus = "SUCCESS".equals(taskStatus) ? "RESOLVED" : "FAILED";
-        boolean processed = "SUCCESS".equals(taskStatus);
         return taskScheduler.getTask(taskId)
                 .flatMap(task -> {
                     String alertId = task.getAlertId();
                     if (alertId == null || alertId.isBlank()) {
                         return Mono.empty();
                     }
-                    // alertRepository 是阻塞 JPA（findById 返回 Optional 不是 Mono）��
-                    // 必须包进 fromCallable 并挪到 boundedElastic，
-                    // 否则跑在 event loop 上，还会把 Optional 当 Reactor 类型编译失败
+                    // 审批状态查询是阻塞 JPA，必须挪进 boundedElastic 并在链内执行，
+                    // 否则会跑在 Netty event loop 上（回调是 WebFlux 入口）。
                     return Mono.fromCallable(() -> {
-                                alertRepository.findById(alertId).ifPresent(alert -> {
-                                    // 只从 ANALYZING 推进到终态，不覆盖更早的状态语义
-                                    alert.setStatus(alertStatus);
-                                    alert.setProcessed(processed);
-                                    alertRepository.save(alert);
-                                });
-                                log.info("任务 {} 终态 {} 已回写告警 {}", taskId, taskStatus, alertId);
+                                boolean approvedRepair = isApprovedRepair(taskId);
+                                if ("SUCCESS".equalsIgnoreCase(taskStatus)) {
+                                    // 成功：一律先进入验证期（执行完成 ≠ 已修复）。
+                                    // 只有真正被人工批准过的修复才计入 (n/3) 轮次与重试预算；
+                                    // 纯只读诊断走「诊断观察期」，保持原有重诊断语义。
+                                    beginVerification(taskId, alertId, approvedRepair);
+                                    return true;
+                                }
+                                applyAlertTerminalStatus(taskId, alertId, taskStatus, approvedRepair);
+                                log.info("任务 {} 终态 {} 已回写告警 {}（approvedRepair={}）",
+                                        taskId, taskStatus, alertId, approvedRepair);
                                 return true;
                             })
                             .subscribeOn(Schedulers.boundedElastic())
@@ -186,6 +214,139 @@ public class AgentCallbackService {
                     return Mono.empty();
                 })
                 .then();
+    }
+
+    /** 该任务是否存在已批准的审批单（= 本次是一次真正被授权的修复）。 */
+    private boolean isApprovedRepair(String taskId) {
+        if (taskId == null || taskId.isBlank()) {
+            return false;
+        }
+        try {
+            return approvalRepository.existsByTaskIdAndStatus(taskId, "APPROVED");
+        } catch (Exception e) {
+            log.warn("查询任务审批状态失败（按非修复任务处理） taskId={}: {}", taskId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 进入 VERIFYING：把任务与告警一起切到「验证中」，并写入轮次/倒计时。
+     *
+     * @param approvedRepair 本次是否是一次被人工批准的修复。
+     *                       true  → 走生产闭环：轮次 (n/max) + 重试预算，验证失败可自动重试/耗尽；
+     *                       false → 只读诊断：不看轮次预算，验证失败按「观察期复现」重新诊断。
+     *
+     * 这里只做状态与计时登记，真正的健康复查由 RecoveryVerificationService 的
+     * 观察期负责（scheduleRecoveryVerification 随后启动）。
+     */
+    private void beginVerification(String taskId, String alertId, boolean approvedRepair) {
+        java.time.LocalDateTime startedAt = java.time.LocalDateTime.now();
+        // 验证窗口与观察期保持一致（默认 5 分钟）：前端倒计时的终点
+        // 就是观察期结束、系统给出结论的时刻。
+        long observeMinutes = recoveryVerificationService.observeMinutes();
+        java.time.LocalDateTime deadline = startedAt.plusMinutes(Math.max(1, observeMinutes));
+        alertLifecycleService.findAlert(alertId).ifPresentOrElse(alert -> {
+            int max = alert.getMaxRetries() == null
+                    ? alertLifecycleService.maxRounds() : Math.max(1, alert.getMaxRetries());
+            int round = alertLifecycleService.beginVerification(alert, startedAt, deadline);
+            if (approvedRepair) {
+                taskScheduler.appendStep(taskId,
+                        "[verify] 修复已执行，进入验证期：第 " + round + "/" + max
+                                + " 轮，观察 " + observeMinutes + " 分钟后给出结论").subscribe();
+                taskScheduler.markVerifying(taskId, round, max, startedAt, deadline,
+                        "修复已执行，等待 " + observeMinutes + " 分钟验证结果").subscribe();
+                log.info("[验证] 任务 {} 进入 VERIFYING 第 {}/{} 轮，截止 {}", taskId, round, max, deadline);
+            } else {
+                // 只读诊断：不占轮次预算，但同样给前端一个验证倒计时
+                taskScheduler.appendStep(taskId,
+                        "[verify] 诊断完成，进入 " + observeMinutes + " 分钟健康观察").subscribe();
+                taskScheduler.markVerifying(taskId, 0, max, startedAt, deadline,
+                        "诊断完成，观察服务是否恢复").subscribe();
+                log.info("[验证] 只读诊断任务 {} 进入观察期，截止 {}", taskId, deadline);
+            }
+        }, () -> {
+            // 告警读不到（极少数异常路径）：至少要保证任务不是假的 SUCCESS
+            taskScheduler.markVerifying(taskId, approvedRepair ? 1 : 0,
+                    alertLifecycleService.maxRounds(), startedAt, deadline, "等待验证结果").subscribe();
+            log.warn("[验证] 任务 {} 找不到关联告警 {}，仅标记任务 VERIFYING", taskId, alertId);
+        });
+    }
+
+    /**
+     * 按任务状态把告警落到对应终态（REGRESSED/FAILED 需撕掉假聚合）。
+     *
+     * @param approvedRepair 是否是一次被人工批准的修复。REGRESSED 时只有修复任务才
+     *                       消耗重试预算；只读诊断的观察期复现只打回 PENDING。
+     */
+    private void applyAlertTerminalStatus(String taskId, String alertId, String taskStatus,
+                                          boolean approvedRepair) {
+        String alertStatus;
+        boolean processed;
+        if ("REJECTED".equalsIgnoreCase(taskStatus)) {
+            // 任务被人工拒绝：告警仍未解决，且不是系统失败，用 REJECTED 语义保留。
+            // 但拒绝后已进入静默冷却期时，告警必须保持 PENDING（未解决）——
+            // Python resume 也会回传一次 REJECTED，绝不能把冷却中的 PENDING 覆盖掉，
+            // 否则冷却规则失效、告警提前被钉成已处理。
+            var optional = alertLifecycleService.findAlert(alertId);
+            if (optional.isPresent() && optional.get().getRejectCooldownUntil() != null) {
+                log.info("任务 {} 回写 REJECTED：告警 {} 正在拒绝冷却期，保持 PENDING 不覆盖",
+                        taskId, alertId);
+                return;
+            }
+            alertStatus = "REJECTED";
+            processed = true;
+        } else if ("REGRESSED".equalsIgnoreCase(taskStatus)) {
+            // 验证失败：不能直接落 PENDING/FAILED —— 必须经重试预算裁决
+            alertLifecycleService.findAlert(alertId).ifPresent(alert -> {
+                AlertLifecycleService.VerificationDecision decision =
+                        alertLifecycleService.onVerificationRegressed(alert, approvedRepair);
+                int max = alert.getMaxRetries() == null
+                        ? alertLifecycleService.maxRounds() : Math.max(1, alert.getMaxRetries());
+                int round = alert.getVerificationRound() == null ? 1 : alert.getVerificationRound();
+                if (decision == AlertLifecycleService.VerificationDecision.EXHAUSTED) {
+                    // 耗尽：任务改 FAILED 并发送最终失败报告（含人工介入指引）
+                    String report = alertLifecycleService.buildExhaustedReport(
+                            alert, Math.max(round, max), max, "连续验证失败");
+                    markTaskExhaustedFailed(taskId, report);
+                } else {
+                    // 还有预算：本任务标记 REGRESSED 收尾，由 RecoveryVerificationService
+                    // 负责拉起下一轮诊断（新任务 → 重新审批 → 再次验证）。
+                    taskScheduler.appendStep(taskId,
+                            "[verify] 第 " + round + "/" + max + " 轮验证失败，已进入自动重试").subscribe();
+                }
+            });
+            return;
+        } else if ("FAILED".equalsIgnoreCase(taskStatus)) {
+            // 执行失败：保留红色 FAILED 提示，交由人工介入（不消耗验证轮次）
+            alertStatus = "FAILED";
+            processed = true;
+        } else {
+            alertStatus = "FAILED";
+            processed = false;
+        }
+        alertLifecycleService.findAlert(alertId).ifPresent(alert -> {
+            // 撕掉假聚合：任务 FAILED 且告警还在 CORRELATED，必须回退并累加次数
+            if ("CORRELATED".equalsIgnoreCase(alert.getStatus()) && "FAILED".equals(alertStatus)) {
+                int next = (alert.getOccurrenceCount() == null ? 1 : alert.getOccurrenceCount()) + 1;
+                alert.setOccurrenceCount(next);
+            }
+            alert.setStatus(alertStatus);
+            alert.setProcessed(processed);
+            alertLifecycleService.save(alert);
+        });
+    }
+
+    /** 重试耗尽：任务落 FAILED 并写入最终失败报告，告警已在状态机里钉死为 FAILED。 */
+    private void markTaskExhaustedFailed(String taskId, String report) {
+        if (taskId == null || taskId.isBlank()) {
+            return;
+        }
+        taskScheduler.completeTask(taskId, report, "FAILED")
+                .then(taskScheduler.appendStep(taskId,
+                        "[verify] 自动重试预算耗尽，停止自动修复，已发送最终失败报告"))
+                .subscribe(
+                        v -> log.warn("[重试耗尽] 任务 {} 已置 FAILED 并输出最终失败报告", taskId),
+                        e -> log.warn("[重试耗尽] 标记任务 FAILED 失败 taskId={}: {}", taskId, e.getMessage()));
     }
 
     /** 把 AgentMessage 压成一行便于前端展示与排查的摘要。 */
@@ -208,11 +369,13 @@ public class AgentCallbackService {
         public String description;
         public String title;
         public String serviceName;
-        public AgentRequest(String taskId, String description, String title, String serviceName) {
+        public boolean readonly;
+        public AgentRequest(String taskId, String description, String title, String serviceName, boolean readonly) {
             this.taskId = taskId;
             this.description = description;
             this.title = title;
             this.serviceName = serviceName;
+            this.readonly = readonly;
         }
     }
 }

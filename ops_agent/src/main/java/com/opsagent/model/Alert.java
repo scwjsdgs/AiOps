@@ -49,6 +49,11 @@ public class Alert {
     private String status;      // PENDING, ANALYZING, RESOLVED, FAILED
 
     /**
+     * 只读诊断标记：预测性预警等告警不许走高危 executor/审批，只输出诊断报告。
+     */
+    private boolean readonly;
+
+    /**
      * Alertmanager webhook 的幂等指纹（默认 alertname|instance|severity）。
      * 独立于其它监控来源，只有 Webhook 通道会设置。
      */

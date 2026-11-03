@@ -10,9 +10,11 @@
 4. 执行完成后把结果写入 execution_results，交回 Supervisor 路由到诊断验证。
 """
 import json
+import logging
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
 
@@ -51,6 +53,13 @@ async def _executor_inner(state: AgentState) -> dict:
             "next_agent": "reporter",
         }
 
+    # 一票否决（第二道防线）：审批通过后、真正执行前再校验一次。
+    # 第一道防线在 _approval_gate 入口（发起审批之前）。这里兜底因为
+    # graph.executor_graph_node 兼容入口可能直接进入本方法。
+    veto = _veto_message(state)
+    if veto is not None:
+        return _veto_result(state, veto)
+
     task_id = state.get("task_id", "")
     langfuse_cb = get_langfuse_callback_handler()
     llm = ChatOpenAI(
@@ -77,10 +86,12 @@ async def _executor_inner(state: AgentState) -> dict:
     max_steps = min(config.AGENT_MAX_ITERATIONS, 4)
     used_signatures = set()
 
+    writer = get_stream_writer()
     for _ in range(max_steps):
         # 滑动窗口 + 兜底清洗：保留最近 window 条消息，并剔除被切断的孤儿
         # ToolMessage / 未配对 tool_calls。
         messages = sanitize_messages(trim_worker_messages(messages, config.MESSAGES_WINDOW_SIZE))
+        writer({"type": "progress", "content": "执行 Agent 正在确认审批并准备执行变更"})
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
         tool_calls = getattr(response, "tool_calls", None) or []
@@ -105,11 +116,14 @@ async def _executor_inner(state: AgentState) -> dict:
                     if func is None:
                         observation = f"未知工具：{name}"
                     else:
+                        writer({"type": "tool_call", "name": name, "args": args})
+                        writer({"type": "progress", "content": f"正在调用 {name} 执行变更"})
                         await callback_service.send_step(task_id, f"执行 Agent 调用 {name}", f"executor_{name}")
                         try:
                             observation = await func.ainvoke(args)
                         except Exception as e:
                             observation = f"工具执行失败：{e}"
+                        writer({"type": "tool_result", "name": name, "content": str(observation)[:500]})
                     results.append({"tool": name, "args": args, "result": str(observation)})
             messages.append(ToolMessage(content=str(observation), tool_call_id=tc["id"]))
         if len(results) >= config.AGENT_MAX_ITERATIONS:
@@ -124,12 +138,57 @@ async def _executor_inner(state: AgentState) -> dict:
     }
 
 
+def _veto_message(state: AgentState) -> str | None:
+    """一票否决判定：诊断结论明确「证据不足/无法确认/不存在」时返回否决原因，否则返回 None。
+
+    这是安全闸门：只要 LLM 没有确认根因，就绝不能申请任何高危操作。
+    哪怕大模型的措辞只是碰巧包含这些字眼，也一律保守拦下，宁可人工介入。
+    """
+    root_cause = str(state.get("root_cause") or "")
+    lowered = root_cause.lower()
+    veto_markers = ("证据不足", "无法确认", "无法确认根因", "不能确认", "无法证实",
+                    "not_found", "deployment 不存在", "deployment not found",
+                    "not found", "不存在", "未发现", "无法验证", "无法判断",
+                    "没有找到根因", "未知根因", "原因不明")
+    for m in veto_markers:
+        if m in lowered:
+            return f"诊断结论包含「{m}」：{root_cause[:200]}"
+    return None
+
+
+def _veto_result(state: AgentState, reason: str) -> dict:
+    """一票否决的返回值：拒绝执行、直接路由 Reporter 收场，报告提示人工介入。"""
+    return {
+        "approval_status": "rejected",
+        "execution_results": [{
+            "tool": "approval",
+            "result": "证据不足，无法自动修复，请人工介入排查。已禁止执行任何写操作。",
+            "args": {
+                "operation": state.get("current_subtask", ""),
+                "reason": f"{reason}",
+            },
+        }],
+        "completed_agents": ["executor"],
+        "next_agent": "reporter",
+    }
+
+
 async def _approval_gate(state: AgentState) -> dict:
     """执行子图内部审批闸门：interrupt 挂起等人工决定（保留 Java 双保险）。
 
     返回值与旧 graph.executor_graph_node 一致：approved 继续执行，
     拒绝/不可用时 fail-closed 直接给 reporter 状态。
     """
+    # 一票否决（第一道防线）：在发起审批、弹窗之前就拦截。
+    # 诊断结论证据不足/未确认根因时，绝不允许创建审批单、申请高危操作，
+    # 直接路由 Reporter 结束并在报告中提示人工介入。
+    if not state.get("chatops"):
+        veto = _veto_message(state)
+        if veto is not None:
+            logging.getLogger(__name__).warning(
+                f"[一票否决] 证据不足，禁止发起审批 task={state.get('task_id')}: {veto[:120]}")
+            return _veto_result(state, veto)
+
     if state.get("approval_status") == "approved":
         return {"approval_status": "approved"}
 
@@ -166,8 +225,13 @@ async def _approval_gate(state: AgentState) -> dict:
         }
 
     if approval_result is not None and (approval_result.data or {}).get("pending"):
-        request["requestId"] = (approval_result.data or {}).get("requestId", request.get("requestId", ""))
-        decision = interrupt({"type": "human_approval", "request": request, "requestId": request.get("requestId", "")})
+        # 必须优先取 Java 本次返回的 requestId。双通道（Kafka/HTTP 降级）下
+        # 同一请求可能产生不同内部 requestId，若沿用旧值会导致 resume 时
+        # 与 Java 审批单不匹配，恢复进程收到“requestId 与当前挂起审批单不匹配”。
+        java_request_id = (approval_result.data or {}).get("requestId") or request.get("requestId", "")
+        java_request_id = str(java_request_id).strip()
+        request["requestId"] = java_request_id
+        decision = interrupt({"type": "human_approval", "request": request, "requestId": java_request_id})
     else:
         return {
             "approval_status": "rejected",

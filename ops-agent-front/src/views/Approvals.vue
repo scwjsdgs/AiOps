@@ -48,7 +48,8 @@
           </h3>
           <p class="page-subtitle">
             高危操作（回滚、扩容超阈值）在执行前必须人工确认；
-            <strong>等待上限 55 秒，超时视为拒绝</strong>（fail-closed，宁可不修也不误改线上）。
+            <strong>等待上限 55 秒，超时视为拒绝并进入 15 分钟静默冷却期</strong>
+            （fail-closed，宁可不修也不误改线上；冷却期内同源告警只累计次数、不再弹窗）。
           </p>
         </div>
         <div class="toolbar">
@@ -71,7 +72,7 @@
         style="margin-bottom: 16px;"
       >
         <template #title>
-          当前有 {{ counts.PENDING }} 个高危操作正在等待决策，请在 55 秒内处理，否则将自动拒绝
+          当前有 {{ counts.PENDING }} 个高危操作正在等待决策，请在 55 秒内处理，否则将自动拒绝并进入 15 分钟静默冷却期
         </template>
       </el-alert>
 
@@ -210,7 +211,7 @@ const loadCounts = async () => {
 const statusTagType = (s) => {
   if (s === 'PENDING') return 'warning'
   if (s === 'APPROVED') return 'success'
-  if (s === 'REJECTED') return 'danger'
+  if (s === 'REJECTED') return 'warning'
   if (s === 'TIMEOUT') return 'info'
   return 'info'
 }
@@ -260,7 +261,7 @@ const approve = async (row) => {
   }
   try {
     await submitDecision(row.requestId, { approved: true, note: '' })
-    ElMessage.success('已批准，agent 将继续执行')
+    ElMessage.success('已批准，agent 将继续执行，执行后进入验证期（最多 3 轮）')
     refreshAll()
   } catch {
     // 提交失败的提示由 request.js 统一处理
@@ -283,7 +284,9 @@ const reject = async (row) => {
   }
   try {
     await submitDecision(row.requestId, { approved: false, note: value.trim() })
-    ElMessage.success('已拒绝')
+    // 拒绝后进入静默冷却（不是彻底终止）：冷却期内同源告警只累计次数，
+    // 冷却结束时若故障仍在持续，系统会自动重新拉起诊断与审批。
+    ElMessage.success('已拒绝，进入 15 分钟静默冷却期（期间同源告警只累计次数，不再弹窗）')
     refreshAll()
   } catch {
     // 提交失败的提示由 request.js 统一处理

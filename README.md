@@ -101,7 +101,7 @@ flowchart LR
 
 | 模块 | 技术栈 | 端口 | 职责 |
 |------|--------|------|------|
-| ops_agent | Java 21 + Spring Boot WebFlux | 8081 | 平台中枢：告警接入、降噪聚合、任务调度、工具执行、鉴权、WebSocket 推送、ChatOps 流式代理 |
+| ops_agent | Java 21 + Spring Boot WebFlux | 8081 | 高并发网关：JWT/Webhook 鉴权、ChatOps SSE 流式代理、Redis 多轮 Memory（30 分钟 TTL）、文档变更事件转发 Kafka、告警/任务/工具/审计/WebSocket |
 | aiops-agent | Python + FastAPI + LangGraph | 5000 | AI 大脑：Supervisor + 多 Worker 状态图、RAG 检索、历史案例自学习 |
 | ops-agent-front | Vue 3 + Pinia + Element Plus | 3000 | 运维管理界面：告警管理、审批管理、任务监控��工具演练、ChatOps 对话 |
 
@@ -207,7 +207,7 @@ opsagent:
    LLM 完全可能把 replicas 写成 9999，那是一次真实的集群打爆。`ScaleUpTool` 在访问 Kubernetes 之前就校验范围（`0..50`），越界直接拒绝，绝不在超限后触达真实集群。
 
 3. **人工审批 = 状态图挂起（interrupt + Checkpointer）**
-   回滚、扩容超阈值触发执行 Agent，经 `interrupt()` 把 LangGraph 图挂起在 Checkpointer；本地开发因缺少 RedisSearch 模块使用 `SqliteSaver`，生产环境配置为 Redis Checkpointer，两者接口一致，Java `/api/approvals/{id}/decision` 后回调 `/api/agent/resume` 恢复。挂起期间不占线程、没有 55s 倒计时；拒绝或服务异常一律 fail-closed，不执行线上变更。
+   回滚、扩容超阈值触发执行 Agent，经 `interrupt()` 把 LangGraph 图挂起在 Checkpointer；本地开发因缺少 RedisSearch 模块使用 `SqliteSaver`，生产环境配置为 Redis Checkpointer，两者接口一致，Java `/api/approvals/{id}/decision` 后回调 `/api/agent/resume` 恢复。挂起期间不占线程、没有 55s 倒计时；拒绝或服务异常一律 fail-closed，不执行线上变更。Java `ApprovalTimeoutScheduler` 每 10 秒扫描 PENDING 审批，超过 `wait-timeout`（默认 55 秒）自动转为 `TIMEOUT`、广播 `APPROVAL_TIMEOUT`，并以拒绝语义通知 Python 恢复，避免审批单和 LangGraph 任务永久挂起成僵尸。
 
 4. **重复执行三道闸门**
    Python 侧基于 LangGraph Checkpointer 的 taskId 互斥（本地 SqliteSaver / 生产 Redis，同一任务只跑一张图）→ Java 侧任务状态机（PENDING/RUNNING/SUCCESS 终态不回退）→ Webhook fingerprint 幂等（Redis SETNX）。上游无论超时重发还是手工重试，重启/扩容这类非幂等操作都不会被执行两次。
@@ -227,17 +227,33 @@ opsagent:
 9. **ChatOps 经 Java 中转而非前端直连 Python**
    Python 用 `X-Internal-Token` 鉴权，前端不该持有内部密钥——密钥一出 Java 就失控。Java 只做流式代理（SSE），保持安全边界。
 
-10. **SSE 流式异常兜底，防止前端死锁**
-    ChatOps 前端曾把对象直接显示成 `[object Object]`，后端遇到 429 / `GraphRecursionError` 时既没有友好错误也没有 `type:end`，导致「正在推理…」永久转圈。现在前端统一从事件的 `content` / `data` 提取可渲染文本，Python 生成器用 `try...except` 捕获 LangGraph 异常并依次发送 `type:error` + `type:end`，断流或结束事件都会立刻关闭 loading。
+10. **SSE 流式异常兜底 + 标准帧代理**
+    ChatOps 前端曾把对象直接显示成 `[object Object]`，后端遇到 429 / `GraphRecursionError` 时既没有友好错误也没有 `type:end`，导致「正在推理…」永久转圈。现在：
+    - Java `/api/chatops/stream` 返回 `Flux<ServerSentEvent<String>>`，按标准 SSE 帧 `data: {...}\n\n` 转发 Python 事件，避免 WebFlux 把 `data:` 剥掉后前端解析不到；
+    - 前端统一从事件的 `content` / `data` 提取可渲染文本，并把 JSON 转义后的 `\n` 还原成真实换行；
+    - Python 生成器用 `try...except` 捕获 LangGraph 异常并依次发送 `type:error` + `type:end`，断流或结束事件都会立刻关闭 loading；
+    - 前端对 SSE 流做 90 秒无事件空闲中断，切走页面时立即 `abort()`，避免 Java/Python 在后台继续跑完整图、反复刷日志。
 
-11. **ChatOps 多会话侧边栏 + Checkpointer 状态保持**
-    ChatOps 升级为类似 DeepSeek 网页版的多会话：左侧历史会话列表、新建/切换会话、默认恢复最近会话。前端把 `session_id` 透传 Java → Python，Python 将其作为 LangGraph `thread_id`（`configurable.thread_id`），SQLite/Redis Checkpointer 保存每个会话的图状态与消息，跨页面、刷新后仍能继续追问。
+11. **ChatOps 多会话侧边栏 + 真流式 + 会话删除**
+    ChatOps 升级为类似 DeepSeek 网页版的多会话：左侧历史会话列表、新建/切换会话、默认恢复最近会话。前端把 `session_id` 透传 Java → Python，Python 将其作为 LangGraph `thread_id`（`configurable.thread_id`），SQLite Checkpointer 保存每个会话的图状态与消息，跨页面、刷新后仍能继续追问。
+
+    为了避免“点清空后切页又恢复旧内容”和“长时间只转圈、最后一次性全部输出”：
+    - 清空对话改为真实删除当前会话历史并新建空会话；
+    - 侧边栏会话支持逐条删除，删除后自动切到新的空会话；
+    - Java 新增 `DELETE /api/chatops/sessions/{sessionId}`，先删 Redis 会话索引，再调用 Python 清理 Checkpointer；
+    - Reporter 用 LangGraph `custom` 流逐 token 输出 `report_token`，前端以打字机效果实时渲染；
+    - 诊断/执行 Agent 每步工具/LLM 调优通过 `progress` 事件推送到同一个 SSE 流，不再长时间空白转圈；
+    - ChatOps 页面通过 `KeepAlive` 缓存，切到其他页面回来不会重新加载并一次性灌出整段历史。
 
 12. **外部模型（润色/评测）全面切换 DeepSeek**
     为降低 429 限流风险并优化成本，`query_rewriter.py`、`reflection.py`、`eval_metrics.py` 与主 Agent 全部统一为 DeepSeek（`deepseek-flash`，`base_url=https://api.deepseek.com/v1`），结构化输出时通过 `extra_body={"thinking":{"type":"disabled"}}` 关闭思考模式。embedding / rerank 仍保留 DashScope 独立通道，因为 DeepSeek 不提供向量能力。
 
 13. **工业级 RAG 检索流水线**
     检索路径：口语 Query → DeepSeek 润色（标准运维术语）→ BM25 关键词 + Chroma 向量双路召回 → RRF 融合 → gte-rerank 精排 Top3。配合 `AgentState + Checkpointer`（本地 SqliteSaver / 生产 Redis，接口一致，审批断点续传）、`Reflection`（报告防幻觉，PASS 才回调）、`LangFuse`（LLM/工具 Trace）与 `Hit@K/MRR` 检索评估，便于把 RAG 效果持续量化提升。
+14. **ChatOps Redis Memory（多轮上下文）**
+    Java 网关按 `chatops:memory:{userId}:{sessionId}` 在 Redis List 中保存最近 5 轮 user/assistant 消息，TTL 30 分钟；每次提问前读取最近 5 轮随 SSE 请求转发给 Python，流正常结束异步落回 Redis。前端断开时 Java 调 `/api/agent/cancel/{taskId}` 级联取消 Python 推理。
+15. **事件驱动 RAG 更新（Chroma 保持唯一向量库）**
+    文档系统变更不触发全量重建：Java `POST /api/rag/docs/webhook` 接收 `{docId, filename, content, status, version}`，校验 `X-Doc-Webhook-Token` 后异步投递 `doc-change` Kafka topic；Python `services/doc_change_consumer.py` 消费并调用 `knowledge_manager.upload_document` 完成切片/embedding/增量 upsert。`archived/deleted` 事件走 `soft_delete_document`，把 Chroma chunk metadata 标记为 `status=DISABLED`，向量检索用数据库层 `where={"status": {"$ne": "DISABLED"}}` 过滤，BM25 构建索引时排除 DISABLED，废弃文档不参与召回且保留版本可恢复。
 
 ## 4. 运行环境
 
@@ -273,6 +289,8 @@ bash apply-monitoring.sh
 # 方式 B：如 port-forward 更顺手，开发时保持这两个后台会话即可：
 #   kubectl port-forward -n monitoring svc/prometheus 9090:9090
 #   kubectl port-forward -n monitoring svc/alertmanager 9093:9093
+# 提示：Prometheus 采集目标（node-exporter/cAdvisor）已改为 Kubernetes Service Discovery，
+# 不再依赖写死的节点 IP。
 
 # 3. 配置环境变量
 cp ops_agent/.env.example ops_agent/.env        # 修改 MYSQL_*、OPSAGENT_INTERNAL_TOKEN、OPSAGENT_WEBHOOK_TOKEN、KAFKA_*
@@ -329,11 +347,13 @@ python aiops-agent/load_test.py --count 100
 | /api/tools/list | GET | 查询已注册工具列表 |
 | /api/tools/agent-exposed | GET | 当前 AI agent 白名单 |
 | /api/tools/execute | POST | 手工执行工具（不受 Agent 白名单限制） |
-| /api/chatops/stream | POST | ChatOps 流式诊断（JWT，SSE，带 `sessionId`） |
+| /api/chatops/stream | POST | ChatOps 流式诊断（JWT，SSE；Java 读 Redis 最近 5 轮 Memory 并转发 Python，正常结束写回 Redis，TTL 30 分钟） |
 | /api/chatops/sessions | POST | 新建 ChatOps 会话 |
 | /api/chatops/sessions | GET | 当前用户历史会话列表 |
 | /api/chatops/sessions/{sessionId} | GET | 拉取指定会话历史消息（Java 校验归属后从 Python Checkpointer 读取） |
+| /api/chatops/sessions/{sessionId} | DELETE | 删除当前用户会话（先删 Redis 索引、Redis Memory，再清理 Python Checkpointer） |
 | /api/agent/callback/* | POST | Python AI 大脑 HTTP 回调接口（step/tool/complete/{taskId}，X-Internal-Token；工具执行作为 Kafka 降级通道保留） |
+| /api/rag/docs/webhook | POST | 文档系统变更 Webhook（X-Doc-Webhook-Token；接收 docId/filename/content/status/version，异步发送 Kafka doc-change 供 Python 增量更新 RAG） |
 | /api/agent/resume/{taskId} | POST | Java 审批决定后恢复 LangGraph interrupt 挂起任务 |
 | /api/agent/trigger_health_check | POST | 手动触发全服务健康巡检 |
 | /api/audit | GET | 安全审计日志（登录/告警/工具/审批/回放） |

@@ -32,6 +32,7 @@ public class AlertIngestionService {
     private final AlertRepository alertRepository;
     private final MeterRegistry meterRegistry;
     private final ImpactAnalysisService impactAnalysisService;
+    private final AlertLifecycleService alertLifecycleService;
 
     private Counter alertReceivedCounter;
     private Counter alertProcessedCounter;
@@ -56,25 +57,98 @@ public class AlertIngestionService {
      * boundedElastic，而不是加个不起作用的注解。
      */
     public Mono<Void> processAlert(Alert alert) {
-        alertReceivedCounter.increment();
-        log.info("Received alert: {}", alert);
+        return processAlert(alert, false);
+    }
 
-        // 1. 保存告警到数据库（Webhook 通道设置的 fingerprint 也要原样落库，
-        //    否则 resolved 事件只能靠随机 UUID 匹配，永远对不上）
-        AlertEntity entity = new AlertEntity();
-        BeanUtils.copyProperties(alert, entity);
-        entity.setFingerprint(alert.getFingerprint());
-        entity.setId(alert.getId() != null ? alert.getId() : UUID.randomUUID().toString());
-        entity.setCreateTime(LocalDateTime.now());
-        entity.setProcessed(false);
-        entity.setStatus("PENDING");
+    /**
+     * 处理一条告警并触发根因分析。
+     *
+     * @param reuseExisting true 表示告警实体已由调用方落库（解除聚合复用老记录时），
+     *                      这里不再新建行，直接以 alert.id 定位已有实体建任务并回填 taskId；
+     *                      false 表示常规入口（REST/Kafka），保持原有「新建 + 保存」逻辑。
+     *                      两种路径都保证新任务落到真实的告警记录上，且建任务成功后把
+     *                      taskId 回写到告警，前端「查看分析」能直接打开报告。
+     */
+    public Mono<Void> processAlert(Alert alert, boolean reuseExisting) {
+        alertReceivedCounter.increment();
+        log.info("processAlert 入口: id={} reuseExisting={} fingerprint={} service={} title={}",
+                alert.getId(), reuseExisting, alert.getFingerprint(),
+                alert.getServiceName(), alert.getTitle());
+
+        // 1. 确定根因分析任务的关联告警实体。
+        //    reuseExisting 时绝不新建行：直接从库中读取调用方已复用/新建的实体，
+        //    锚点就是它，任务与告警的关联不会因为「解除聚合」而割裂成两条记录。
+        Mono<AlertEntity> anchorMono;
+        if (reuseExisting) {
+            anchorMono = Mono.fromCallable(() -> {
+                        if (alert.getId() == null || alert.getId().isBlank()) {
+                            return (AlertEntity) null;
+                        }
+                        return alertRepository.findById(alert.getId()).orElse(null);
+                    })
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .flatMap(existing -> {
+                        if (existing == null) {
+                            // 兜底：调用方所谓「已落库」实际上没查到（异常路径），
+                            // 退化为新建，宁可多建也不让告警无任务。
+                            log.warn("reuseExisting 但库中找不到 id={}（或 id 为空），退化为新建实体", alert.getId());
+                            return Mono.fromCallable(() -> saveNewAlert(alert));
+                        }
+                        log.info("processAlert 复用已有告警实体 alertId={} status={} occurrenceCount={}",
+                                existing.getId(), existing.getStatus(), existing.getOccurrenceCount());
+                        return Mono.just(existing);
+                    });
+        } else {
+            // 常规入口：新建告警并保存（Webhook 以外的 REST/Kafka 场景）。
+            anchorMono = Mono.fromCallable(() -> saveNewAlert(alert));
+        }
+
+        // 任何锚点解析异常（数据库抖动、findById 抛异常等）都不能让告警静默丢失：
+        // 退化为新建一条并继续建任务。
+        Mono<AlertEntity> safeAnchor = anchorMono
+                .onErrorResume(e -> {
+                    log.error("解析告警锚点异常，退化为新建（避免任务静默丢失） id={} reuseExisting={}: {}",
+                            alert.getId(), reuseExisting, e.getMessage(), e);
+                    return Mono.fromCallable(() -> saveNewAlert(alert));
+                });
 
         // 2. 创建根因分析任务
-        return Mono.fromCallable(() -> alertRepository.save(entity))
-                // JPA 是阻塞 IO，直接跑在 Netty event loop 上，并发一上来整个服务会被拖死
+        return safeAnchor
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(saved -> {
                     String alertId = saved.getId();
+                    // 【业务规则一】拒绝冷却 / 重试耗尽 的二次防线：
+                    // Webhook 通道已在入口按 fingerprint 拦截，但 REST / Kafka 通道直接
+                    // 调用 processAlert，且不做降噪聚合（每次新建一行），必须在这里同样拦住。
+                    // 抑制对象按「本次锚点 → 同服务最近一条冷却/耗尽记录」顺序查找：
+                    // 同一服务持续报错就该被抑制，不该因为 REST 通道不聚合而绕开防骚扰规则。
+                    AlertLifecycleService.SuppressAction suppress = alertLifecycleService.checkSuppress(saved);
+                    AlertEntity suppressTarget = saved;
+                    if (suppress == AlertLifecycleService.SuppressAction.NONE) {
+                        AlertEntity sibling = findCoolingSibling(saved);
+                        if (sibling != null) {
+                            suppress = alertLifecycleService.checkSuppress(sibling);
+                            suppressTarget = sibling;
+                        }
+                    }
+                    if (suppress != AlertLifecycleService.SuppressAction.NONE) {
+                        int next = (suppressTarget.getOccurrenceCount() == null ? 1 : suppressTarget.getOccurrenceCount()) + 1;
+                        suppressTarget.setOccurrenceCount(next);
+                        alertRepository.save(suppressTarget);
+                        // 新落库的这行是重复噪音：直接删除，避免列表里堆满同服务的重复告警。
+                        // 发生次数已累加到冷却中的主记录上，前端看到的是「该故障已持续 X 次」。
+                        if (!java.util.Objects.equals(suppressTarget.getId(), saved.getId())) {
+                            try {
+                                alertRepository.deleteById(saved.getId());
+                            } catch (Exception delEx) {
+                                log.warn("清理重复告警行失败 alertId={}: {}", saved.getId(), delEx.getMessage());
+                            }
+                        }
+                        log.info("[{}] 告警 {} 命中抑制（主记录 {}），仅累加次数至 {}，不建任务不弹审批",
+                                suppress, saved.getId(), suppressTarget.getId(), next);
+                        return Mono.empty();
+                    }
+                    log.info("processAlert 锚点确认 alertId={} reuseExisting={} -> 开始建任务", alertId, reuseExisting);
                     // 触发分析前先把影响面算出来，拼进任务输入 ——
                     // 让 LLM 一开始就知道「这影响了哪些流量入口、是否已断流」，
                     // 而不必自己从零散日志里猜。查不到就退回原始描述，不阻塞建任务。
@@ -84,22 +158,98 @@ public class AlertIngestionService {
                                     : "服务 " + safeServiceName(alert.getServiceName()) + " 发生告警：" + alert.getTitle());
                     return taskScheduler.createTask("ROOT_CAUSE_ANALYSIS", alertId, input)
                             .flatMap(task -> {
-                                // 这里是 fire-and-forget，绝不能等 agent 跑完。
-                                // ReAct 循环要几十秒到几分钟，而前端 axios 只等 10 秒，
-                                // 同步等结果会让 POST /api/alerts 必定超时。
-                                // 注意必须用 onComplete 回调标记 ANALYZING：notifyAgent
-                                // 返回 Mono<Void>，完成时不发任何元素，两参数 subscribe
-                                // 的 onNext 永远不会触发，告警会永远停在 PENDING。
-                                agentCallbackService.notifyAgent(task.getId(), input,
-                                alert.getTitle(), alert.getServiceName())
-                                        .subscribe(
-                                                null,
-                                                e -> markAlert(alertId, "FAILED", false),
-                                                () -> markAlert(alertId, "ANALYZING", true));
-                                return Mono.just(task);
+                                log.info("processAlert 已建任务 taskId={} alertId={} inputLen={}",
+                                        task.getId(), alertId, input == null ? 0 : input.length());
+                                // 建任务成功后把 taskId 回写到告警实体：解除聚合/复用的老记录
+                                // 踢出新任务后必须知道「这次是哪个任务在分析」，否则前端
+                                // 无法从告警跳转到新报告，列表也看不到本次分析的关联。
+                                return Mono.fromCallable(() -> {
+                                            if (alertId == null || alertId.isBlank()) {
+                                                return (AlertEntity) null;
+                                            }
+                                            return alertRepository.findById(alertId).orElse(null);
+                                        })
+                                        .flatMap(e -> {
+                                            if (e != null) {
+                                                e.setTaskId(task.getId());
+                                                alertRepository.save(e);
+                                                log.info("processAlert 告警 {} taskId 已回写为 {}", alertId, task.getId());
+                                            }
+                                            return Mono.just(task);
+                                        })
+                                        // 回写失败不影响主链路
+                                        .onErrorResume(err -> {
+                                            log.warn("回写告警 taskId 失败 alertId={} taskId={}: {}",
+                                                    alertId, task.getId(), err.getMessage());
+                                            return Mono.just(task);
+                                        })
+                                        .flatMap(t -> {
+                                            // 这里是 fire-and-forget，绝不能等 agent 跑完。
+                                            // ReAct 循环要几十秒到几分钟，而前端 axios 只等 10 秒，
+                                            // 同步等结果会让 POST /api/alerts 必定超时。
+                                            // 注意必须用 onComplete 回调标记 ANALYZING：notifyAgent
+                                            // 返回 Mono<Void>，完成时不发任何元素，两参数 subscribe
+                                            // 的 onNext 永远不会触发，告警会永远停在 PENDING。
+                                            agentCallbackService.notifyAgent(t.getId(), input,
+                                                    alert.getTitle(), alert.getServiceName(), alert.isReadonly())
+                                                    .subscribe(
+                                                            null,
+                                                            e -> markAlert(alertId, "FAILED", false),
+                                                            () -> markAlert(alertId, "ANALYZING", true));
+                                            log.info("processAlert 已通知 Agent taskId={}，等待回传", t.getId());
+                                            return Mono.just(t);
+                                        });
                             });
                 })
                 .then();
+    }
+
+    /** 新建一条告警实体（常规入口专用）。 */
+    private AlertEntity saveNewAlert(Alert alert) {
+        AlertEntity entity = new AlertEntity();
+        BeanUtils.copyProperties(alert, entity);
+        entity.setFingerprint(alert.getFingerprint());
+        entity.setId(alert.getId() != null ? alert.getId() : UUID.randomUUID().toString());
+        entity.setCreateTime(LocalDateTime.now());
+        entity.setProcessed(false);
+        entity.setStatus("PENDING");
+        return alertRepository.save(entity);
+    }
+
+    /**
+     * 查找同服务下仍在冷却期/已重试耗尽的记录。
+     *
+     * REST / Kafka 通道每次告警都会新建一行，无法像 Webhook 那样按 fingerprint 命中
+     * 主记录。防骚扰规则必须基于「同一故障」而不是「同一行」，所以这里按服务名
+     * 找最近一条仍处于冷却中（或已耗尽）的记录，把新告警的次数累加到它身上。
+     *
+     * 找不到返回 null（正常放行）。
+     */
+    private AlertEntity findCoolingSibling(AlertEntity current) {
+        String service = current == null ? null : current.getServiceName();
+        if (service == null || service.isBlank()) {
+            return null;
+        }
+        try {
+            // 冷却中的记录状态是 PENDING；耗尽的是 FAILED，两种都要看。
+            java.util.List<AlertEntity> recent = alertRepository
+                    .findByServiceNameAndStatusInOrderByCreateTimeDesc(
+                            service, java.util.List.of("PENDING", "FAILED"));
+            for (AlertEntity candidate : recent) {
+                if (candidate == null || java.util.Objects.equals(candidate.getId(), current.getId())) {
+                    continue;
+                }
+                boolean cooling = candidate.getRejectCooldownUntil() != null;
+                boolean exhausted = candidate.getRetryExhaustedAt() != null;
+                if (cooling || exhausted) {
+                    return candidate;
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            log.warn("查找同服务冷却记录失败（放行新告警） service={}: {}", service, e.getMessage());
+            return null;
+        }
     }
 
     /**

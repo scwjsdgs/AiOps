@@ -148,7 +148,9 @@ const ALERT_STATUS_MAP = {
   RESOLVED: { type: 'success', text: '已解决' },
   CORRELATED: { type: 'info', text: '已聚合' },
   FAILED: { type: 'danger', text: '失败' },
-  TIMEOUT: { type: 'warning', text: '超时' }
+  TIMEOUT: { type: 'warning', text: '超时' },
+  REJECTED: { type: 'warning', text: '已拒绝' },
+  VERIFYING: { type: 'warning', text: '验证中' }
 }
 
 export const alertStatusMeta = (s) =>
@@ -164,18 +166,57 @@ export const alertStatusMeta = (s) =>
 const TASK_STATUS_MAP = {
   PENDING: { type: 'info', text: '排队中' },
   RUNNING: { type: 'warning', text: '分析中' },
+  VERIFYING: { type: 'primary', text: '验证中' },
   SUCCESS: { type: 'success', text: '已完成' },
   FAILED: { type: 'danger', text: '失败' },
   TIMEOUT: { type: 'warning', text: '超时' },
-  REGRESSED: { type: 'danger', text: '修复后复现' }
+  REGRESSED: { type: 'danger', text: '修复后复现' },
+  REJECTED: { type: 'warning', text: '已拒绝' },
+  CANCELLED: { type: 'info', text: '已取消' }
 }
 
+/**
+ * 任务状态标签。FAILED 在任务上就是「失败」；告警侧的 FAILED 语义是
+ * 「重试耗尽、已停止自动修复」，两套映射分开，避免同一个词在两个页面含义漂移。
+ */
 export const taskStatusMeta = (s) =>
   TASK_STATUS_MAP[String(s || '').toUpperCase()] || { type: 'info', text: s || '未知' }
 
 /** 任务是否已到终态：终态停止轮询，未终态每 3 秒续查 */
 export const isFinalTaskStatus = (s) =>
-  ['SUCCESS', 'FAILED', 'TIMEOUT', 'REGRESSED'].includes(String(s || '').toUpperCase())
+  ['SUCCESS', 'FAILED', 'TIMEOUT', 'REGRESSED', 'REJECTED', 'CANCELLED'].includes(String(s || '').toUpperCase())
+
+// ---------------------------- 验证轮次 / 冷却倒计时 ----------------------------
+
+/**
+ * 距今剩余秒数。截止时间可能来自后端 LocalDateTime 串（无时区），
+ * 用 parseDateTime 解析；无效值返回 null，调用方据此不显示倒计时。
+ */
+export const secondsUntil = (deadline) => {
+  const d = parseDateTime(deadline)
+  if (!d) return null
+  return Math.max(0, Math.floor((d.getTime() - Date.now()) / 1000))
+}
+
+/** 秒数转为 "m:ss"，前端倒计时统一展示格式 */
+export const formatCountdown = (totalSeconds) => {
+  const s = Math.max(0, Math.floor(Number(totalSeconds) || 0))
+  const m = Math.floor(s / 60)
+  const sec = s % 60
+  return `${m}:${String(sec).padStart(2, '0')}`
+}
+
+/**
+ * 验证轮次文案："第 2/3 轮"。
+ * round 为 0 表示只读诊断（不占修复轮次），返回空串由调用方决定是否展示。
+ */
+export const verificationRoundText = (task) => {
+  if (!task) return ''
+  const round = Number(task.verificationRound) || 0
+  const max = Number(task.maxRetries) || 3
+  if (round <= 0) return ''
+  return `第 ${round}/${max} 轮`
+}
 
 // ---------------------------- 推理步骤分型 ----------------------------
 

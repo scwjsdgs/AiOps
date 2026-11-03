@@ -27,8 +27,10 @@ REPAIR_ACTION_MAP = {
 }
 
 
-def _svc_params(service: str, **extra) -> dict:
+def _svc_params(service: str, namespace: str = None, **extra) -> dict:
     params = {"service": service, "deployment": service}
+    if namespace:
+        params["namespace"] = namespace
     params.update(extra)
     return params
 
@@ -147,9 +149,10 @@ def create_diagnostic_tools(task_id: str):
         return await _search_knowledge_base(query)
 
     @tool
-    async def get_service_status(service: str) -> str:
-        """查询服务当前运行状态（副本数、就绪情况、镜像版本）"""
-        return await _read_tool(task_id, "get_status", _svc_params(service), "status_check")
+    async def get_service_status(service: str, namespace: str = "") -> str:
+        """查询服务当前运行状态（副本数、就绪情况、镜像版本）。
+        namespace 可选：告警明确来自某命名空间（如 monitoring）时传入，缺省按 default 查。"""
+        return await _read_tool(task_id, "get_status", _svc_params(service, namespace), "status_check")
 
     @tool
     async def analyze_logs(service: str, lines: int = 100, keyword: str = "ERROR") -> str:
@@ -159,9 +162,10 @@ def create_diagnostic_tools(task_id: str):
         )
 
     @tool
-    async def query_pod_events(service: str) -> str:
-        """查询 Deployment 下 Pod 的 Kubernetes 事件（ImagePullBackOff、CrashLoopBackOff、OOMKilled、探针失败等），根因定位首选。"""
-        return await _read_tool(task_id, "query_pod_events", _svc_params(service), "pod_events")
+    async def query_pod_events(service: str, namespace: str = "") -> str:
+        """查询 Deployment 下 Pod 的 Kubernetes 事件（ImagePullBackOff、CrashLoopBackOff、OOMKilled、探针失败等），根因定位首选。
+        namespace 可选：告警明确来自某命名空间时传入，缺省按 default 查。"""
+        return await _read_tool(task_id, "query_pod_events", _svc_params(service, namespace), "pod_events")
 
     @tool
     async def query_metrics(query: str) -> str:
@@ -169,9 +173,10 @@ def create_diagnostic_tools(task_id: str):
         return await _read_tool(task_id, "query_metrics", {"query": query, "promql": query}, "metrics_query")
 
     @tool
-    async def query_impact(service: str) -> str:
-        """分析故障影响面：该服务的流量入口（Service）有哪些、是否已断流、哪些实例异常。"""
-        return await _read_tool(task_id, "query_impact", _svc_params(service), "impact_analysis")
+    async def query_impact(service: str, namespace: str = "") -> str:
+        """分析故障影响面：该服务的流量入口（Service）有哪些、是否已断流、哪些实例异常。
+        namespace 可选：告警明确来自某命名空间时传入，缺省按 default 查。"""
+        return await _read_tool(task_id, "query_impact", _svc_params(service, namespace), "impact_analysis")
 
     return [
         search_knowledge_base,

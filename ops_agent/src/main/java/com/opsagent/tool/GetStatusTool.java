@@ -46,10 +46,13 @@ public class GetStatusTool extends KubernetesToolBase implements Tool {
         if (name == null) {
             return Tool.failure("Missing 'deployment' parameter（也接受 'service'）", start);
         }
+        // 跨 namespace 查询：优先取告警/调用方传入的 namespace，回退到默认配置。
+        // alertmanager 等来源的告警明确带 namespace 时，不能写死在 default 里查。
+        String ns = p.strOr(namespace, "namespace", "namespaceName");
 
         try {
             Deployment deployment = client.apps().deployments()
-                    .inNamespace(namespace).withName(name).get();
+                    .inNamespace(ns).withName(name).get();
 
             if (deployment == null) {
                 // 这里返回 success=true 而不是失败：deployment 不存在是一个事实，
@@ -57,13 +60,13 @@ public class GetStatusTool extends KubernetesToolBase implements Tool {
                 // 而不是看到"查询失败"后去重试别的工具。
                 Map<String, Object> data = new LinkedHashMap<>();
                 data.put("deployment", name);
-                data.put("namespace", namespace);
+                data.put("namespace", ns);
                 data.put("status", "not_found");
                 data.put("replicas", 0);
                 data.put("readyReplicas", 0);
                 data.put("image", "unknown");
                 data.put("conditions", List.of());
-                return Tool.success("Deployment " + name + " not found in namespace " + namespace, data, start);
+                return Tool.success("Deployment " + name + " not found in namespace " + ns, data, start);
             }
 
             int replicas = deployment.getSpec() != null && deployment.getSpec().getReplicas() != null
@@ -87,7 +90,7 @@ public class GetStatusTool extends KubernetesToolBase implements Tool {
 
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("deployment", name);
-            data.put("namespace", namespace);
+            data.put("namespace", ns);
             // status 是 Python 侧直接读的 key，必须始终存在
             data.put("status", derived);
             data.put("replicas", replicas);

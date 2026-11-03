@@ -25,7 +25,10 @@
                    style="width: 110px; margin-top: 8px;" @change="loadTasks(1)">
           <el-option label="排队中" value="PENDING" />
           <el-option label="分析中" value="RUNNING" />
+          <el-option label="验证中" value="VERIFYING" />
           <el-option label="已完成" value="SUCCESS" />
+          <el-option label="已拒绝" value="REJECTED" />
+          <el-option label="已取消" value="CANCELLED" />
           <el-option label="修复后复现" value="REGRESSED" />
           <el-option label="失败" value="FAILED" />
           <el-option label="超时" value="TIMEOUT" />
@@ -124,9 +127,23 @@
 
         <el-scrollbar class="detail-scroll">
           <div class="detail-content">
+            <!-- 验证中提示：轮次 + 倒计时，让用户知道系统正在验证而不是卡住 -->
+            <VerifyStatusBar
+              v-if="currentTask.status === 'VERIFYING'"
+              :round="Number(currentTask.verificationRound) || 0"
+              :max="Number(currentTask.maxRetries) || 3"
+              :deadline="currentTask.verificationDeadline || ''"
+              :note="currentTask.verifyNote || ''"
+              style="margin-bottom: 16px;"
+            />
+
             <el-descriptions :column="2" border size="small">
               <el-descriptions-item label="状态">
                 <StatusTag :status="currentTask.status" kind="task" size="small" />
+                <span v-if="currentTask.status === 'VERIFYING' && currentTask.verificationRound"
+                      class="verify-round-tag">
+                  {{ verificationRoundText(currentTask) }}
+                </span>
               </el-descriptions-item>
               <el-descriptions-item label="类型">{{ currentTask.type || '—' }}</el-descriptions-item>
               <el-descriptions-item label="创建时间">
@@ -224,9 +241,10 @@ import {
 } from '@element-plus/icons-vue'
 import StatusTag from '@/components/StatusTag.vue'
 import CopyId from '@/components/CopyId.vue'
+import VerifyStatusBar from '@/components/VerifyStatusBar.vue'
 import {
   formatTime, fromNow, durationBetween, isFinalTaskStatus,
-  stepKind, stepToolName, copyText
+  stepKind, stepToolName, copyText, verificationRoundText
 } from '@/utils/format'
 
 const route = useRoute()
@@ -297,7 +315,8 @@ const loadTasks = async (p = page.value, { silent = false } = {}) => {
 }
 
 // ---------------------------- 自动轮询 ----------------------------
-// 进入页面后每 10 秒静默刷新一次，新任务自动出现并高亮，不必手动点刷新。
+// 任务列表变化不频繁（分钟级），30 秒静默刷新一次；新任务自动出现并高亮。
+// 背景页隐藏时跳过，减少对 Redis SCAN 的无效压力。
 let listTimer = null
 const startListPolling = () => {
   stopListPolling()
@@ -305,7 +324,7 @@ const startListPolling = () => {
     // 用户正在输入搜索词时不要打断（避免列表在打字过程中跳变）
     if (document.hidden) return
     loadTasks(page.value, { silent: true })
-  }, 10000)
+  }, 30000)
 }
 const stopListPolling = () => {
   if (listTimer) {
@@ -519,6 +538,13 @@ onUnmounted(() => {
   padding: 14px 16px;
   border-bottom: 1px solid var(--c-border);
   flex-shrink: 0;
+}
+
+.verify-round-tag {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--c-primary);
+  font-weight: 600;
 }
 
 .list-panel__filters {

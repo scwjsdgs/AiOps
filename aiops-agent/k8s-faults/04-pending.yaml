@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-pending
+  namespace: default
+  labels:
+    app: fault-pending
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fault-pending
+  template:
+    metadata:
+      labels:
+        app: fault-pending
+    spec:
+      nodeSelector:
+        disktype: ssd-not-exist
+      containers:
+        - name: nginx
+          image: nginx:1.24
+          imagePullPolicy: IfNotPresent

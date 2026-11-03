@@ -30,7 +30,11 @@ public class TaskSchedulerService {
     private static final int MAX_STEP_CHARS = 500;
     /** 每个任务保留的 step 条数上限：agent 最多 8 轮，200 条足够排查。 */
     private static final int MAX_STEPS = 200;
-    /** 任务保留时长：不设 TTL 的话任务永久堆积，SCAN 列表会越来越慢。7 天足够复盘。 */
+    /**
+     * 任务保留时长：不设 TTL 的话任务永久堆积，SCAN 列表会越来越慢。
+     * 至少 24 小时，且每次更新都需要继续续期，否则一次不带 TTL 的 set
+     * 就会把整个任务的过期时间清掉（前端断线后任务莫名变孤儿）。
+     */
     private static final Duration TASK_TTL = Duration.ofDays(7);
 
     public Mono<Task> createTask(String type, String alertId, String input) {
@@ -46,7 +50,36 @@ public class TaskSchedulerService {
         task.setUpdatedAt(LocalDateTime.now());
         return redisTemplate.opsForValue()
                 .set(TASK_KEY_PREFIX + task.getId(), task, TASK_TTL)
-                .then(Mono.just(task));
+                .then(Mono.just(task))
+                .onErrorResume(e -> {
+                    log.warn("Redis 创建任务失败（降级为空，任务不再持久化） id={}: {}", task.getId(), e.getMessage());
+                    return Mono.empty();
+                });
+    }
+
+    /**
+     * 创建或覆盖一个任务（ChatOps 每次提问都会生成一个新的 taskId，用同一个
+     * 入口写 Redis，避免出现“任务不存在，状态更新被忽略”）。
+     */
+    public Mono<Boolean> createOrReplace(Task task) {
+        if (task == null || task.getId() == null || task.getId().isBlank()) {
+            return Mono.just(false);
+        }
+        if (task.getCreatedAt() == null) {
+            task.setCreatedAt(LocalDateTime.now());
+        }
+        if (task.getUpdatedAt() == null) {
+            task.setUpdatedAt(LocalDateTime.now());
+        }
+        if (task.getAgentSteps() == null) {
+            task.setAgentSteps(new ArrayList<>());
+        }
+        return redisTemplate.opsForValue()
+                .set(TASK_KEY_PREFIX + task.getId(), task, TASK_TTL)
+                .onErrorResume(e -> {
+                    log.warn("Redis 写入任务失败（降级） id={}: {}", task.getId(), e.getMessage());
+                    return Mono.just(false);
+                });
     }
 
     /**
@@ -56,7 +89,11 @@ public class TaskSchedulerService {
     public Mono<Task> getTask(String id) {
         return redisTemplate.opsForValue()
                 .get(TASK_KEY_PREFIX + id)
-                .cast(Task.class);
+                .cast(Task.class)
+                .onErrorResume(e -> {
+                    log.warn("Redis 读取任务失败（按不存在降级） id={}: {}", id, e.getMessage());
+                    return Mono.empty();
+                });
     }
 
     /** 分页列出任务（兼容原有调用：不带 status/keyword 过滤）。 */
@@ -79,7 +116,53 @@ public class TaskSchedulerService {
      */
     public Mono<List<Task>> listTasks(String alertId, String status, String keyword, int page, int size) {
         return listTasksViaScan(alertId, status, keyword, page, size)
-                .subscribeOn(Schedulers.boundedElastic());
+                .subscribeOn(Schedulers.boundedElastic())
+                .onErrorResume(e -> {
+                    log.warn("Redis 任务列表查询超时降级为空列表: {}", e.getMessage());
+                    return Mono.just(new ArrayList<>());
+                });
+    }
+
+    /**
+     * 列出全部任务（用于后台扫描超时/僵尸任务，不参与前端分页）。
+     * 复用 SCAN 实现，忽略分页；与 listTasks 共用同一套容错（单条坏数据降级为空）。
+     */
+    public Mono<List<Task>> listAllTasks() {
+        return listTasksViaScan(null, null, null, 1, Integer.MAX_VALUE)
+                .subscribeOn(Schedulers.boundedElastic())
+                .onErrorResume(e -> {
+                    log.warn("Redis 全量任务扫描超时降级为空列表: {}", e.getMessage());
+                    return Mono.just(new ArrayList<>());
+                });
+    }
+
+    /**
+     * 清理残留任务（运维端点用）。
+     *
+     * @param status          只清理指定状态的任务；null/blank 表示清理全部
+     * @param olderThanMinutes 只清理创建时间早于 now-该分钟数的任务；<=0 表示不按时间过滤
+     * @return 清理的任务 key 数量
+     */
+    public Mono<Integer> purgeTasks(String status, int olderThanMinutes) {
+        return listAllTasks()
+                .flatMapMany(Flux::fromIterable)
+                .filter(task -> task != null && task.getId() != null && !task.getId().isBlank())
+                .filter(task -> status == null || status.isBlank()
+                        || status.equalsIgnoreCase(task.getStatus() == null ? "" : task.getStatus()))
+                .filter(task -> olderThanMinutes <= 0 || task.getCreatedAt() == null
+                        || task.getCreatedAt().isBefore(LocalDateTime.now().minusMinutes(olderThanMinutes)))
+                .flatMap(task -> redisTemplate.opsForValue().delete(TASK_KEY_PREFIX + task.getId())
+                        .map(deleted -> Boolean.TRUE.equals(deleted) ? 1 : 0)
+                        .onErrorResume(e -> {
+                            log.warn("清理任务 key 失败 id={}: {}", task.getId(), e.getMessage());
+                            return Mono.just(0);
+                        }))
+                .reduce(0, Integer::sum)
+                .subscribeOn(Schedulers.boundedElastic())
+                .onErrorResume(e -> {
+                    log.warn("清理任务失败（降级为 0）: {}", e.getMessage());
+                    return Mono.just(0);
+                });
     }
 
     private Mono<List<Task>> listTasksViaScan(String alertId, String status, String keyword, int page, int size) {
@@ -90,9 +173,16 @@ public class TaskSchedulerService {
                         return Mono.just(new ArrayList<Task>());
                     }
                     List<Mono<Task>> reads = keys.stream()
-                            .map(k -> redisTemplate.<String, Object>opsForValue().get(k).cast(Task.class))
+                            .map(k -> redisTemplate.<String, Object>opsForValue().get(k)
+                                    .cast(Task.class)
+                                    // 单条读取超时/坏数据不能拖垮整页；降级为空并记录一次
+                                    .onErrorResume(e -> {
+                                        log.warn("读取任务 key {} 失败（跳过）: {}", k, e.getMessage());
+                                        return Mono.empty();
+                                    }))
                             .toList();
-                    return Flux.merge(reads)
+                    // 限并发读取：Redis 连接池有限，key 多时一次全并发会触发 command timed out。
+                    return Flux.merge(Flux.fromIterable(reads), 8)
                             .filter(java.util.Objects::nonNull)
                             .filter(t -> alertId == null || alertId.isBlank() || alertId.equals(t.getAlertId()))
                             .filter(t -> matchesStatus(t, status))
@@ -100,6 +190,10 @@ public class TaskSchedulerService {
                             .sort(java.util.Comparator.comparing(Task::getCreatedAt,
                                     java.util.Comparator.nullsLast(java.util.Comparator.reverseOrder())))
                             .collectList()
+                            .onErrorResume(e -> {
+                                log.warn("任务列表扫描失败（降级为空列表）: {}", e.getMessage());
+                                return Mono.just(new ArrayList<>());
+                            })
                             .map(list -> {
                                 int from = Math.max(page - 1, 0) * size;
                                 if (from >= list.size()) {
@@ -175,14 +269,27 @@ public class TaskSchedulerService {
                         return Mono.just((long) keys.size());
                     }
                     List<Mono<Task>> reads = keys.stream()
-                            .map(k -> redisTemplate.<String, Object>opsForValue().get(k).cast(Task.class))
+                            .map(k -> redisTemplate.<String, Object>opsForValue().get(k)
+                                    .cast(Task.class)
+                                    .onErrorResume(e -> {
+                                        log.warn("读取任务 key {} 失败（跳过）: {}", k, e.getMessage());
+                                        return Mono.empty();
+                                    }))
                             .toList();
-                    return Flux.merge(reads)
+                    return Flux.merge(Flux.fromIterable(reads), 8)
                             .filter(java.util.Objects::nonNull)
                             .filter(t -> alertId == null || alertId.isBlank() || alertId.equals(t.getAlertId()))
                             .filter(t -> matchesStatus(t, status))
                             .filter(t -> matchesKeyword(t, keyword))
-                            .count();
+                            .count()
+                            .onErrorResume(e -> {
+                                log.warn("Redis 任务计数超时降级为 0: {}", e.getMessage());
+                                return Mono.just(0L);
+                            });
+                })
+                .onErrorResume(e -> {
+                    log.warn("Redis 任务计数扫描超时降级为 0: {}", e.getMessage());
+                    return Mono.just(0L);
                 });
     }
 
@@ -199,6 +306,32 @@ public class TaskSchedulerService {
         return mutate(id, task -> {
             task.setOutput(output);
             task.setStatus(status);
+        });
+    }
+
+    /**
+     * 进入验证态：修复已批准并执行完成，接下来 5 分钟观察是否真正恢复。
+     *
+     * 轮次 / 截止时间写在任务上，前端任务详情页据此展示「第 n/3 轮 + 倒计时」，
+     * 用户不用猜系统在干什么。任务状态保持 VERIFYING（非终态），
+     * 前端会继续轮询，直到验证得出 SUCCESS / REGRESSED / FAILED。
+     */
+    public Mono<Boolean> markVerifying(String id, int round, int maxRetries,
+                                       LocalDateTime startedAt, LocalDateTime deadline, String note) {
+        return mutate(id, task -> {
+            task.setStatus("VERIFYING");
+            task.setVerificationRound(round);
+            task.setMaxRetries(maxRetries);
+            task.setVerificationStartedAt(startedAt);
+            task.setVerificationDeadline(deadline);
+            task.setVerifyNote(note);
+        });
+    }
+
+    /** 验证结束（通过/失败/耗尽）后清掉倒计时，避免前端显示已过期的"验证中"。 */
+    public Mono<Boolean> clearVerifyingCountdown(String id) {
+        return mutate(id, task -> {
+            task.setVerificationDeadline(null);
         });
     }
 
@@ -273,9 +406,16 @@ public class TaskSchedulerService {
                 .flatMap(task -> {
                     mutator.accept(task);
                     task.setUpdatedAt(LocalDateTime.now());
+                    // 每次写回都带 TTL 续期。不带 TTL 的 set 会把任务的过期时间
+                    // 清成永久键；一旦超过实例内存上限触发淘汰，回调查询就会看到
+                    // “任务不存在”，形成孤儿任务。这里统一续期到 TASK_TTL。
                     return redisTemplate.opsForValue()
-                            .set(TASK_KEY_PREFIX + id, task)
-                            .then(Mono.just(true));
+                            .set(TASK_KEY_PREFIX + id, task, TASK_TTL)
+                            .then(Mono.just(true))
+                            .onErrorResume(e -> {
+                                log.warn("Redis 更新任务失败（降级） id={}: {}", id, e.getMessage());
+                                return Mono.just(false);
+                            });
                 })
                 .switchIfEmpty(Mono.defer(() -> {
                     log.warn("任务 {} 不存在，状态更新被忽略（Redis 里没有 {}）", id, TASK_KEY_PREFIX + id);

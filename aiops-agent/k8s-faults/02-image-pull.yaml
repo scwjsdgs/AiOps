@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-image-pull
+  namespace: default
+  labels:
+    app: fault-image-pull
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fault-image-pull
+  template:
+    metadata:
+      labels:
+        app: fault-image-pull
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:not-exist-v999
+          imagePullPolicy: Always

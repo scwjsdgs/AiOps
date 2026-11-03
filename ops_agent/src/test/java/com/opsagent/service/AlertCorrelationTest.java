@@ -18,7 +18,7 @@ class AlertCorrelationTest {
 
     private String buildCorrelationKey(java.util.Map<String, String> labels) throws Exception {
         AlertWebhookService service = new AlertWebhookService(
-                null, null, null, null, null);
+                null, null, null, null, null, null, null);
         Method m = AlertWebhookService.class.getDeclaredMethod("buildCorrelationKey", Map.class);
         m.setAccessible(true);
         return (String) m.invoke(service, labels);

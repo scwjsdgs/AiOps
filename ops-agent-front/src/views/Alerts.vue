@@ -75,12 +75,48 @@
           </template>
         </el-table-column>
 
+        <el-table-column label="验证 / 冷却" width="150">
+          <template #default="{ row }">
+            <!-- 验证中：修复类展示第 n/3 轮，只读诊断展示"观察中"；
+                 让用户知道系统正在努力而不是卡住 -->
+            <el-tooltip v-if="row.status === 'VERIFYING'"
+                        :content="verifyingTooltip(row)" placement="top">
+              <el-tag type="primary" size="small" effect="plain" class="mono">
+                <el-icon class="is-loading"><Loading /></el-icon>
+                {{ row.verificationRound > 0 ? `第 ${row.verificationRound}/${row.maxRetries || 3} 轮` : '健康观察中' }}
+              </el-tag>
+            </el-tooltip>
+            <!-- 拒绝冷却中：说明为什么不再弹窗 -->
+            <el-tooltip v-else-if="isCoolingDown(row)"
+                        content="用户拒绝后进入静默冷却期：期间仅累计次数、不再弹窗；冷却结束仍在报错会自动重新拉起"
+                        placement="top">
+              <el-tag type="warning" size="small" effect="plain">
+                冷却 {{ coolingRemain(row) }}
+              </el-tag>
+            </el-tooltip>
+            <!-- 重试耗尽：已停止自动修复 -->
+            <el-tooltip v-else-if="row.retryExhaustedAt"
+                        content="连续 3 轮验证失败，已停止自动修复，需人工介入" placement="top">
+              <el-tag type="danger" size="small" effect="plain">已停止重试</el-tag>
+            </el-tooltip>
+            <span v-else class="text-muted">—</span>
+          </template>
+        </el-table-column>
+
         <el-table-column label="标题" min-width="260">
           <template #default="{ row }">
             <div class="cell-title">
               <el-tooltip :content="row.title" placement="top-left" :show-after="400">
-                <span class="cell-title__text">{{ row.title || '—' }}</span>
+                <span class="cell-title__text" :class="{ 'cell-title__text--escalated': isEscalated(row) }">
+                  {{ row.title || '—' }}
+                </span>
               </el-tooltip>
+              <!-- 报警升级：同一指纹反复爆发（拒绝/超时/复现后仍在崩），后端在标题前
+                   加 [严重恶化] 前缀。这里单独渲染一个醒目标签，让用户一眼看出
+                   这不是普通一次告警，而是修复反复失败、故障持续恶化。 -->
+              <el-tag v-if="isEscalated(row)" size="small" type="danger" effect="dark" class="tag-escalated">
+                严重恶化
+              </el-tag>
               <el-tag v-if="row.source === 'anomaly-detector'" size="small" type="warning" effect="plain">
                 预测性预警
               </el-tag>
@@ -97,6 +133,17 @@
               {{ row.serviceName }}
             </span>
             <span v-else class="text-muted">—</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="发生次数" width="110">
+          <template #default="{ row }">
+            <el-tooltip content="该故障已持续发生 X 次（同服务同指纹聚合）" placement="top">
+              <el-tag v-if="row.occurrence > 1" type="warning" size="small" effect="plain" class="mono">
+                {{ row.occurrence }} 次
+              </el-tag>
+              <span v-else class="text-muted">1 次</span>
+            </el-tooltip>
           </template>
         </el-table-column>
 
@@ -217,7 +264,7 @@
 
           <div v-if="impact && impact.summary" class="impact-summary">{{ impact.summary }}</div>
 
-          <div v-show="hasTopology" ref="topologyChartRef" class="topology-chart"></div>
+          <div v-if="hasTopology" ref="topologyChartRef" class="topology-chart"></div>
           <div v-if="!hasTopology" class="chart-empty">该服务未关联 Service，无拓扑关系可展示</div>
         </div>
 
@@ -316,18 +363,18 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { getAlerts, getAlertStats, sendAlert } from '@/api/alert'
-import { getTasks } from '@/api/task'
+import { getTask, getTasks } from '@/api/task'
 import { getClusterTopology, getClusterImpact } from '@/api/cluster'
 import { ElMessage } from 'element-plus'
 import { marked } from 'marked'
 import * as echarts from 'echarts'
 import {
-  Warning, Search, Refresh, Plus, Share, List, Document, DocumentCopy
+  Warning, Search, Refresh, Plus, Share, List, Document, DocumentCopy, Loading
 } from '@element-plus/icons-vue'
 import StatusTag from '@/components/StatusTag.vue'
 import CopyId from '@/components/CopyId.vue'
 import {
-  formatTime, fromNow, durationBetween, stepKind, stepToolName, copyText
+  formatTime, fromNow, durationBetween, stepKind, stepToolName, copyText, secondsUntil, formatCountdown
 } from '@/utils/format'
 
 // ---------------------------- 列表状态 ----------------------------
@@ -353,9 +400,14 @@ const alertStatusOptions = {
   TIMEOUT: { text: '超时' }
 }
 
-// 顶部统计卡片：数字来自当前列表的 total，以及各状态字典
+// 顶部统计卡片：活跃告警数 = 除 RESOLVED/REJECTED 外所有状态之和
+const activeAlertCount = computed(() => {
+  const sc = statusCounts.value
+  return (sc.PENDING || 0) + (sc.FIRING || 0) + (sc.ANALYZING || 0)
+    + (sc.REGRESSED || 0) + (sc.CORRELATED || 0) + (sc.VERIFYING || 0) + (sc.TIMEOUT || 0)
+})
 const summaryCards = computed(() => [
-  { key: 'all', label: '当前条件告警数', value: total.value, tone: 'primary', icon: 'Bell' },
+  { key: 'all', label: '当前条件告警数', value: activeAlertCount.value, tone: 'primary', icon: 'Bell' },
   { key: 'PENDING', label: '待分析', value: statusCount('PENDING') + statusCount('FIRING'), tone: 'warning', icon: 'Clock' },
   { key: 'ANALYZING', label: '分析中', value: statusCount('ANALYZING'), tone: 'info', icon: 'Loading' },
   { key: 'RESOLVED', label: '已解决', value: statusCount('RESOLVED'), tone: 'success', icon: 'CircleCheck' }
@@ -410,9 +462,44 @@ const sourceText = (s) => {
 // 轮询新发现的告警 ID：用于高亮提示"有新告警进来了"
 const newIds = ref(new Set())
 
+// 报警升级识别：后端在标题前加 [严重恶化] 前缀（同一指纹反复爆发且修复反复失败）。
+// 只认前缀，避免误伤正文里恰好出现该词的普通告警。
+const ESCALATION_PREFIX = '[严重恶化]'
+const isEscalated = (row) => String(row?.title || '').startsWith(ESCALATION_PREFIX)
+
+// ---------------------------- 验证 / 冷却 展示 ----------------------------
+// nowTick 每秒 +1 驱动倒计时文案刷新：冷却/验证剩余时间必须实时变化，
+// 否则用户看到的永远是进页面那一刻的秒数，倒计时形同虚设。
+const nowTick = ref(0)
+let clockTimer = null
+// 「验证中」的提示：让用户看到当前是第几轮、还剩多久，而不是以为系统卡住了。
+const verifyingTooltip = (row) => {
+  void nowTick.value // 订阅时钟，保证剩余时间随秒刷新
+  const remain = secondsUntil(row.verificationDeadline)
+  const round = row.verificationRound || 1
+  const max = row.maxRetries || 3
+  const tail = remain !== null ? `，本轮剩余 ${formatCountdown(remain)}` : ''
+  return `修复已执行，正在验证服务是否真正恢复（第 ${round}/${max} 轮${tail}）；验证失败会自动重试，最多 ${max} 轮`
+}
+
+// 拒绝冷却：后端记录 rejectCooldownUntil（未到期且状态仍为 PENDING 才算冷却中）
+const isCoolingDown = (row) => {
+  void nowTick.value
+  if (!row?.rejectCooldownUntil) return false
+  const remain = secondsUntil(row.rejectCooldownUntil)
+  return remain !== null && remain > 0
+}
+const coolingRemain = (row) => {
+  void nowTick.value
+  const remain = secondsUntil(row.rejectCooldownUntil)
+  return remain === null ? '' : formatCountdown(remain)
+}
+
 const rowClass = ({ row }) => {
   // 新到告警优先高亮，压过下面的状态色
   if (newIds.value.has(row.id)) return 'row-new'
+  // 严重恶化行最高优先级（压过普通 FIRING/FAILED 的红边）
+  if (isEscalated(row)) return 'row-escalated'
   if (row.status === 'FIRING' || row.status === 'FAILED') return 'row-attention'
   if (row.status === 'CORRELATED') return 'row-muted'
   return ''
@@ -431,6 +518,28 @@ const loadAlerts = async (p = page.value, { silent = false } = {}) => {
     })
     const records = res.data?.records || []
 
+    // 前端去重：按 服务名 + 指纹 聚合，只保留每组最新一条。
+    // 避免历史遗留的重复已聚合记录在列表里堆积。
+    const dedup = new Map()
+    for (const r of records) {
+      const key = `${r.serviceName || ''}|${r.fingerprint || r.id || ''}`
+      const existing = dedup.get(key)
+      if (!existing || (r.createTime || r.createdAt || '') >= (existing.createTime || existing.createdAt || '')) {
+        dedup.set(key, r)
+      }
+    }
+    const deduped = [...dedup.values()]
+    // 为每组补充 occurrence：优先用后端 occurrenceCount，否则前端统计该 key 的记录数
+    const countMap = new Map()
+    records.forEach(r => {
+      const key = `${r.serviceName || ''}|${r.fingerprint || r.id || ''}`
+      countMap.set(key, (countMap.get(key) || 0) + 1)
+    })
+    deduped.forEach(r => {
+      const key = `${r.serviceName || ''}|${r.fingerprint || r.id || ''}`
+      r.occurrence = r.occurrenceCount || countMap.get(key) || 1
+    })
+
     if (silent && alerts.value.length) {
       const known = new Set(alerts.value.map(a => a.id))
       const fresh = records.filter(a => a.id && !known.has(a.id)).map(a => a.id)
@@ -444,8 +553,10 @@ const loadAlerts = async (p = page.value, { silent = false } = {}) => {
       }
     }
 
-    alerts.value = records
+    alerts.value = deduped
     total.value = res.data?.total || 0
+    // 列表刷新后同步刷新顶部统计卡片，避免用旧缓存数据
+    loadStatusCounts()
     page.value = p
   } catch (e) {
     // 轮询失败保留原数据，避免网络抖动把列表清空
@@ -459,8 +570,8 @@ const loadAlerts = async (p = page.value, { silent = false } = {}) => {
 }
 
 // ---------------------------- 自动轮询 ----------------------------
-// 新告警由后端 Kafka 消费后落库，前端此前只能手动点刷新才看得到。
-// 这里每 10 秒静默拉一次，新告警高亮标注，无需人工干预。
+// 告警列表变化不频繁（分钟级），30 秒静默拉一次，新告警高亮标注。
+// 背景页隐藏 / 弹窗打开时跳过，减少对 MySQL like 查询与 Redis 的压力。
 let listTimer = null
 const startListPolling = () => {
   stopListPolling()
@@ -469,7 +580,7 @@ const startListPolling = () => {
     // 弹窗打开时不刷新列表：避免用户正在看报告时背后列表跳动
     if (dialogVisible.value) return
     loadAlerts(page.value, { silent: true })
-  }, 10000)
+  }, 30000)
 }
 const stopListPolling = () => {
   if (listTimer) {
@@ -530,6 +641,10 @@ const loadImpactAndTopology = async (service) => {
   impact.value = null
   impactService.value = service || ''
   hasTopology.value = false
+  if (topologyChart) {
+    topologyChart.dispose()
+    topologyChart = null
+  }
   if (!service) return
 
   try {
@@ -552,57 +667,60 @@ const loadImpactAndTopology = async (service) => {
 // Service → Pod 关系图：红色节点 = 异常（断流的 Service / 未就绪的 Pod）
 const renderTopology = (data) => {
   nextTick(() => {
-    if (!topologyChartRef.value) return
-    if (topologyChart) {
-      topologyChart.dispose()
-      topologyChart = null
-    }
-    topologyChart = echarts.init(topologyChartRef.value)
+    // v-if 容器刚挂载时可能还没有可用的宽高，等下一帧稳定后再初始化
+    setTimeout(() => {
+      if (!topologyChartRef.value) return
+      if (topologyChart) {
+        topologyChart.dispose()
+        topologyChart = null
+      }
+      topologyChart = echarts.init(topologyChartRef.value)
 
-    const nodes = (data.nodes || []).map(n => ({
-      id: n.id,
-      name: n.name,
-      category: n.category === 'service' ? 0 : 1,
-      symbolSize: n.category === 'service' ? 48 : 32,
-      itemStyle: {
-        color: n.category === 'service'
-          ? (n.outage ? '#ef4444' : '#2563eb')
-          : (n.ready ? '#10b981' : '#f59e0b'),
-        borderColor: '#fff',
-        borderWidth: 2,
-        shadowBlur: 8,
-        shadowColor: 'rgba(15,23,42,0.15)'
-      },
-      value: n.category === 'service'
-        ? `就绪端点 ${n.readyEndpoints ?? '?'} / 未就绪 ${n.notReadyEndpoints ?? '?'}${n.outage ? '（已断流）' : ''}`
-        : `就绪：${n.ready ? '是' : '否'}${n.deployment ? '｜Deployment ' + n.deployment : ''}`
-    }))
+      const nodes = (data.nodes || []).map(n => ({
+        id: n.id,
+        name: n.name,
+        category: n.category === 'service' ? 0 : 1,
+        symbolSize: n.category === 'service' ? 48 : 32,
+        itemStyle: {
+          color: n.category === 'service'
+            ? (n.outage ? '#ef4444' : '#2563eb')
+            : (n.ready ? '#10b981' : '#f59e0b'),
+          borderColor: '#fff',
+          borderWidth: 2,
+          shadowBlur: 8,
+          shadowColor: 'rgba(15,23,42,0.15)'
+        },
+        value: n.category === 'service'
+          ? `就绪端点 ${n.readyEndpoints ?? '?'} / 未就绪 ${n.notReadyEndpoints ?? '?'}${n.outage ? '（已断流）' : ''}`
+          : `就绪：${n.ready ? '是' : '否'}${n.deployment ? '｜Deployment ' + n.deployment : ''}`
+      }))
 
-    topologyChart.setOption({
-      tooltip: {
-        formatter: (p) => (p.dataType === 'edge' ? '' : `<b>${p.name}</b><br/>${p.data.value || ''}`)
-      },
-      legend: {
-        data: ['Service', 'Pod'],
-        top: 0,
-        icon: 'circle',
-        textStyle: { fontSize: 12, color: '#475569' }
-      },
-      series: [{
-        type: 'graph',
-        layout: 'force',
-        roam: true,
-        draggable: true,
-        label: { show: true, position: 'right', fontSize: 11, color: '#1e293b' },
-        force: { repulsion: 380, edgeLength: 120, gravity: 0.08 },
-        edgeSymbol: ['none', 'arrow'],
-        edgeSymbolSize: 8,
-        lineStyle: { color: '#cbd5e1', curveness: 0.08, width: 1.4 },
-        categories: [{ name: 'Service' }, { name: 'Pod' }],
-        data: nodes,
-        links: (data.links || []).map(l => ({ source: l.source, target: l.target }))
-      }]
-    })
+      topologyChart.setOption({
+        tooltip: {
+          formatter: (p) => (p.dataType === 'edge' ? '' : `<b>${p.name}</b><br/>${p.data.value || ''}`)
+        },
+        legend: {
+          data: ['Service', 'Pod'],
+          top: 0,
+          icon: 'circle',
+          textStyle: { fontSize: 12, color: '#475569' }
+        },
+        series: [{
+          type: 'graph',
+          layout: 'force',
+          roam: true,
+          draggable: true,
+          label: { show: true, position: 'right', fontSize: 11, color: '#1e293b' },
+          force: { repulsion: 380, edgeLength: 120, gravity: 0.08 },
+          edgeSymbol: ['none', 'arrow'],
+          edgeSymbolSize: 8,
+          lineStyle: { color: '#cbd5e1', curveness: 0.08, width: 1.4 },
+          categories: [{ name: 'Service' }, { name: 'Pod' }],
+          data: nodes,
+          links: (data.links || []).map(l => ({ source: l.source, target: l.target }))
+        }]
+      })
+    }, 0)
   })
 }
 
@@ -630,9 +748,16 @@ const viewAnalysis = async (row) => {
   showAllSteps.value = false
 
   try {
-    const res = await getTasks({ alertId: row.id, page: 1, size: 1 })
-    const records = res.data?.records || []
-    currentTask.value = records[0] || null
+    // CORRELATED 告警的 taskId 指向主任务 ID，直接查任务详情；
+    // 没有 taskId 才退回按 alertId 查（历史/常规告警）。
+    if (row.taskId) {
+      const res = await getTask(row.taskId)
+      currentTask.value = res.data || null
+    } else {
+      const res = await getTasks({ alertId: row.id, page: 1, size: 1 })
+      const records = res.data?.records || []
+      currentTask.value = records[0] || null
+    }
   } catch {
     ElMessage.error('查询分析任务失败')
     currentTask.value = null
@@ -694,10 +819,16 @@ onMounted(() => {
   loadAlerts(1)
   loadStatusCounts()
   startListPolling()
+  // 倒计时时钟：每秒推进一次，冷却/验证剩余时间才会实时跳动
+  clockTimer = setInterval(() => { nowTick.value += 1 }, 1000)
 })
 
 onUnmounted(() => {
   stopListPolling()
+  if (clockTimer) {
+    clearInterval(clockTimer)
+    clockTimer = null
+  }
   if (topologyChart) topologyChart.dispose()
 })
 </script>
@@ -823,6 +954,25 @@ onUnmounted(() => {
 
 .text-muted {
   color: var(--c-text-muted);
+}
+
+/* 严重恶化行：整行红色背景 + 左侧粗红边，反复爆发且修复失败时非常醒目 */
+:deep(.row-escalated) td {
+  background-color: var(--c-danger-soft) !important;
+}
+:deep(.row-escalated) td:first-child {
+  box-shadow: inset 4px 0 0 var(--c-danger);
+}
+.cell-title__text--escalated {
+  color: var(--c-danger);
+  font-weight: 700;
+}
+.tag-escalated {
+  animation: escalated-pulse 1.2s ease-in-out infinite;
+}
+@keyframes escalated-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 
 /* 未处理行左侧红边，扫读时先看到需要注意的 */

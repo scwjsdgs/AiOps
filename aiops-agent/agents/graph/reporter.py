@@ -8,6 +8,7 @@ execution_results、impact_summary 和原任务输入；所有事实必须能在
 """
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
+from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph, START, END
 
 from config import config
@@ -50,8 +51,14 @@ async def _reporter_inner(state: AgentState) -> dict:
     ]
     # 报告场景同样受 trim 保护：若输入证据非常长，先按消息窗口压缩
     messages = sanitize_messages(trim_worker_messages(messages, config.MESSAGES_WINDOW_SIZE))
-    result = await llm.ainvoke(messages)
-    report = (result.content or "").strip()
+    report_parts = []
+    writer = get_stream_writer()
+    async for chunk in llm.astream(messages):
+        token = getattr(chunk, "content", "")
+        if token:
+            report_parts.append(str(token))
+            writer({"type": "report_token", "token": str(token)})
+    report = "".join(report_parts).strip() or "报告生成失败：模型未返回有效内容。"
     return {
         "report": report,
         "next_agent": "end",

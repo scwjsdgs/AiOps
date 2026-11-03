@@ -26,13 +26,28 @@
     </template>
 
     <div class="approval-body">
-      <div class="approval-row">
-        <span class="approval-row__label">操作</span>
-        <span class="approval-row__value mono">{{ approval.operation || '—' }}</span>
+      <div v-if="approval.serviceName" class="approval-service">
+        <span class="approval-service__label">目标服务</span>
+        <b class="approval-service__name">{{ approval.serviceName }}</b>
+        <span class="approval-service__ns">(namespace: {{ approval.namespace || 'default' }})</span>
       </div>
       <div class="approval-row">
+        <span class="approval-row__label">操作</span>
+        <span class="approval-row__value mono">
+          {{ approval.operation || '—' }}<template v-if="targetHint">（目标：{{ targetHint }}）</template>
+        </span>
+      </div>
+      <div class="approval-row approval-row--reason">
         <span class="approval-row__label">原因</span>
-        <span class="approval-row__value">{{ approval.reason || '—' }}</span>
+        <div class="approval-reason">
+          <!-- 折叠摘要：只显示 ROOT_CAUSE/前 3 行，避免 Markdown 长文淹没关键信息 -->
+          <div v-if="!expanded" class="approval-reason__summary">{{ reasonSummary }}</div>
+          <!-- 展开后 Markdown 渲染（##/粗体正常显示） -->
+          <div v-if="expanded" class="approval-reason__full markdown" v-html="renderedReason"></div>
+          <el-button v-if="reasonLong" link type="primary" size="small" @click="expanded = !expanded">
+            {{ expanded ? '收起完整诊断依据' : '展开查看完整诊断依据' }}
+          </el-button>
+        </div>
       </div>
       <div class="approval-row">
         <span class="approval-row__label">请求号</span>
@@ -43,7 +58,7 @@
       <div class="approval-countdown">
         <div class="approval-countdown__text">
           <el-icon><Timer /></el-icon>
-          <span>剩余 <b>{{ remain }}</b> 秒，超时后系统将自动拒绝</span>
+          <span>剩余 <b>{{ remain }}</b> 秒，超时后系统将自动拒绝并进入 15 分钟静默冷却期</span>
         </div>
         <el-progress
           :percentage="percent"
@@ -51,6 +66,16 @@
           :stroke-width="6"
           :color="progressColor"
         />
+      </div>
+
+      <!-- 批准后的行为说明：执行完不是立刻成功，而是进入最多 3 轮验证 -->
+      <div class="approval-hint">
+        <el-icon><InfoFilled /></el-icon>
+        <span>
+          批准后 agent 执行变更，并进入验证期（每轮 5 分钟，最多 3 轮）；
+          验证失败会再次请求审批，连续 3 轮失败则停止自动修复并生成最终失败报告。
+          拒绝则进入 15 分钟冷却，期间同源告警只累计次数、不再弹窗。
+        </span>
       </div>
     </div>
 
@@ -70,9 +95,34 @@
 <script setup>
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { BellFilled, Timer } from '@element-plus/icons-vue'
+import { BellFilled, Timer, InfoFilled } from '@element-plus/icons-vue'
 import { useWebSocketStore } from '@/store/websocket'
 import { submitDecision } from '@/api/approval'
+import { marked } from 'marked'
+
+const expanded = ref(false)
+const targetHint = computed(() => {
+  const p = approval.value.podName || ''
+  if (p) return p
+  const m = String(approval.value.reason || '').match(/\b([a-z0-9]+-[a-z0-9]{6,10}-[a-z0-9]{5})\b/)
+  return m ? m[1] : ''
+})
+const reasonLong = computed(() => String(approval.value.reason || '').length > 80)
+// 折叠摘要：优先取 ROOT_CAUSE 一行，否则取前 3 行并截断到约 50 字
+const reasonSummary = computed(() => {
+  const raw = String(approval.value.reason || '')
+  const lines = raw.split('\n').map(s => s.trim()).filter(Boolean)
+  const root = lines.find(l => /^ROOT_CAUSE\s*[:=]/i.test(l))
+  const base = root || lines[0] || raw
+  return base.length > 50 ? base.slice(0, 50) + '…' : base
+})
+const renderedReason = computed(() => {
+  try {
+    return marked.parse(String(approval.value.reason || ''), { breaks: true })
+  } catch {
+    return approval.value.reason || ''
+  }
+})
 
 const wsStore = useWebSocketStore()
 
@@ -99,6 +149,7 @@ const progressColor = computed(() => {
 watch(() => wsStore.pendingApproval, (val) => {
   if (val) {
     approval.value = val
+    expanded.value = false
     remain.value = val.timeout || 55
     visible.value = true
     startCountdown()
@@ -117,6 +168,8 @@ const startCountdown = () => {
     if (remain.value <= 0) {
       stopCountdown()
       visible.value = false
+      // 同时清掉全局待审批状态，避免审批已超时但 store 里仍残留僵尸审批。
+      wsStore.pendingApproval = null
       ElMessage.warning('审批已超时，系统自动拒绝')
     }
   }, 1000)
@@ -167,7 +220,7 @@ const decide = async (approved) => {
       approved,
       note: approved ? '从全局提醒弹窗批准' : '从全局提醒弹窗拒绝'
     })
-    ElMessage.success(approved ? '已批准，AI 将继续执行' : '已拒绝，AI 将改用安全方案')
+    ElMessage.success(approved ? '已批准，AI 将继续执行，执行后进入验证期' : '已拒绝，进入 15 分钟静默冷却期')
     wsStore.pendingApproval = null
     visible.value = false
     stopCountdown()
@@ -214,6 +267,72 @@ onUnmounted(stopCountdown)
 
 .approval-body {
   padding: 2px 0;
+}
+
+.approval-service {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 10px 12px;
+  margin: 2px 0 8px;
+  background: var(--c-primary-soft);
+  border-radius: var(--radius-md);
+}
+
+.approval-service__label {
+  font-size: 12px;
+  color: var(--c-text-muted);
+}
+
+.approval-service__name {
+  font-size: 14px;
+  font-family: Consolas, monospace;
+  color: var(--c-primary);
+}
+
+.approval-service__ns {
+  font-size: 11.5px;
+  color: var(--c-text-muted);
+}
+
+.approval-row--reason {
+  align-items: flex-start;
+}
+
+.approval-reason {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--c-text-secondary);
+  line-height: 1.55;
+}
+
+.approval-reason__summary {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.approval-reason__full.markdown :deep(h1),
+.approval-reason__full.markdown :deep(h2),
+.approval-reason__full.markdown :deep(h3) {
+  font-size: 13.5px;
+  margin: 8px 0 4px;
+  color: var(--c-text);
+}
+
+.approval-reason__full.markdown :deep(p) {
+  margin: 5px 0;
+}
+
+.approval-reason__full.markdown :deep(strong) {
+  color: var(--c-text);
+}
+
+.approval-reason__full.markdown :deep(code) {
+  background: var(--c-info-soft);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
 }
 
 .approval-row {
@@ -267,5 +386,21 @@ onUnmounted(stopCountdown)
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.approval-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--c-text-muted);
+}
+
+.approval-hint .el-icon {
+  margin-top: 2px;
+  flex-shrink: 0;
+  color: var(--c-info);
 }
 </style>

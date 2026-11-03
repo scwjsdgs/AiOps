@@ -9,6 +9,8 @@ class Alert(BaseModel):
     serviceName: str
     host: Optional[str] = None
     detail: Optional[str] = None
+    # 只读诊断标记：预测性预警等告警不许走高危 executor/审批，只输出诊断报告。
+    readonly: Optional[bool] = False
 
 class AgentMessage(BaseModel):
     type: str

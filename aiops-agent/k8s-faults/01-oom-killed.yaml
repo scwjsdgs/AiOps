@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-oom
+  namespace: default
+  labels:
+    app: fault-oom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fault-oom
+  template:
+    metadata:
+      labels:
+        app: fault-oom
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.24
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              memory: 10Mi
+            requests:
+              memory: 10Mi

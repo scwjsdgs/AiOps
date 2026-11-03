@@ -50,8 +50,10 @@ public class QueryImpactTool implements Tool {
         if (name == null) {
             return Tool.failure("Missing 'deployment' parameter（也接受 'service'）", start);
         }
+        // 跨 namespace 查询：告警明确带 namespace 时按它查，否则回退默认配置。
+        String ns = p.str("namespace", "namespaceName");
 
-        Map<String, Object> analysis = impactAnalysisService.analyze(name);
+        Map<String, Object> analysis = impactAnalysisService.analyze(name, ns);
         if (!Boolean.TRUE.equals(analysis.get("available"))) {
             // 「查不到」不代表工具执行失败：把原因如实带回，LLM 会据此说明
             // "该服务可能未部署或没有流量入口"，而不是去重试别的工具。

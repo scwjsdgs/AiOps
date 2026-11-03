@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-probe
+  namespace: default
+  labels:
+    app: fault-probe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fault-probe
+  template:
+    metadata:
+      labels:
+        app: fault-probe
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.24
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /health-error
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3

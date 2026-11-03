@@ -69,6 +69,7 @@ class AgentState(TypedDict, total=False):
     # 执行 Agent 的审批与执行结果
     approval_status: Optional[str]       # none / pending / approved / rejected / timeout
     approval_request: Optional[Dict[str, Any]]
+    last_completed_request_id: Optional[str]  # 最近一次已决审批 ID，仅审计，不作为挂起凭证
     execution_results: Annotated[list[Dict[str, Any]], _dedup_append]
 
     # Supervisor 路由控制

@@ -50,7 +50,7 @@ Java `opsagent.prometheus.url=http://localhost:9090`，前端通过 Java 代理�
 curl -s http://localhost:9090/-/healthy
 
 # 各采集目标
-curl -s 'http://localhost:9090/api/v1/query?query=up'
+curl -s 'http://localhost:9090/api/v1/targets'
 
 # Deployment 副本
 curl -s 'http://localhost:9090/api/v1/query?query=kube_deployment_spec_replicas'
@@ -64,9 +64,14 @@ curl -H "Authorization: Bearer <JWT>" http://localhost:8081/api/cluster/metrics
 # 期望 connected=true，且有 deploymentReplicas/containerCpu/containerMemory 数据
 ```
 
+采集目标已从“写死节点 IP”改为 **Kubernetes Service Discovery**：
+`03-prometheus.yaml` 中 `node-exporter` / `cAdvisor` 都使用 `kubernetes_sd_configs: role: node`，
+节点 IP 变化后无需再手工改 Prometheus 配置。RBAC 已授权 `nodes`、`nodes/metrics`、`nodes/proxy`、`pods` 等资源。
+
 ## 关键踩坑记录
 
 - Prometheus 的 serviceAccountToken projected token 必须使用默认 audience，不能设 `audience: api`，否则 Kubernetes SD 持续 Unauthorized。
 - kubelet 的 cAdvisor 抓取路径是 `https://<node-ip>:10250/metrics/cadvisor`，带 SA token，RBAC 需授权 `nodes/metrics`。
+- 使用 K8s SD 后 Prometheus 会自动从 `__meta_kubernetes_node_address_InternalIP` 拼出 `:9100` 与 `:10250`，不再依赖 `kind-config.yaml` 里写死的节点端口。
 - Alertmanager 根路由不允许 matcher，`route.match/match_re` 必须去掉或移到子路由。
 - Alertmanager `webhook_configs.http_config` 在 v0.34 不接受 `timeout` 字段。

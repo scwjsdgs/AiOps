@@ -18,6 +18,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -58,26 +59,42 @@ public class TopologyService {
     private long cacheSeconds;
 
     /**
-     * Pod 名 → 指向它的 Service 名列表。
+     * Pod 名 → 指向它的 Service 名列表（默认 namespace）。
      *
      * 优先读缓存；缓存未命中时现场构建一次。构建失败返回空表 —— 查询类能力，
      * 拿不到影响面不应该是错误，agent 照常按日志分析。
      */
     public Map<String, List<String>> podToServices() {
-        Map<String, List<String>> cached = readCache();
+        return podToServices(null);
+    }
+
+    /**
+     * Pod 名 → 指向它的 Service 名列表。
+     *
+     * @param namespace 目标 namespace；null/空白时回退默认配置。
+     *                  优先读该 namespace 的缓存；缓存未命中时现场构建。
+     */
+    public Map<String, List<String>> podToServices(String namespace) {
+        String ns = resolveNamespace(namespace);
+        Map<String, List<String>> cached = readCache(ns);
         if (cached != null) {
             return cached;
         }
-        Map<String, List<String>> built = buildPodToServices();
-        writeCache(built);
+        Map<String, List<String>> built = buildPodToServices(ns);
+        writeCache(ns, built);
         return built;
     }
 
-    /** 现场构建 Pod → Services 映射。 */
-    private Map<String, List<String>> buildPodToServices() {
+    /** 解析 namespace：空值回退到默认配置，避免各处重复写三元表达式。 */
+    private String resolveNamespace(String namespace) {
+        return (namespace == null || namespace.isBlank())
+                ? holder.namespace() : namespace.trim();
+    }
+
+    /** 现场构建 Pod → Services 映射（指定 namespace）。 */
+    private Map<String, List<String>> buildPodToServices(String namespace) {
         Map<String, Set<String>> index = new LinkedHashMap<>();
         try {
-            String namespace = holder.namespace();
             List<io.fabric8.kubernetes.api.model.Service> services =
                     holder.client().services().inNamespace(namespace).list().getItems();
 
@@ -162,43 +179,116 @@ public class TopologyService {
 
     /**
      * Deployment → 指向它的 Service 列表（去重）。
-     * Deployment 本身不属于任何 Service，但它下面的 Pod 属于 —— 取并集。
+     *
+     * 两条路径互为兜底：
+     * 1. Pod 反查：Deployment 的 Pod 在跑时，凭 Pod 名 → Service 的解析最准
+     *    （含未就绪 Pod，故障态也要算）。
+     * 2. 静态 label 匹配：Deployment 副本为 0（没有 Pod 可反查）时，通过
+     *    「Service.selector ⊆ Deployment template.labels」直接关联 ——
+     *    否则 0 副本服务的 Service 永远「未关联」，影响面分析报假「无入口」。
      */
     public List<String> servicesOfDeployment(String deploymentName) {
-        Map<String, List<String>> index = podToServices();
+        return servicesOfDeployment(deploymentName, null);
+    }
+
+    /**
+     * Deployment → 指向它的 Service 列表（去重），可指定 namespace。
+     *
+     * @param namespace 目标 namespace；null/空白时回退默认配置。
+     */
+    public List<String> servicesOfDeployment(String deploymentName, String namespace) {
+        String ns = resolveNamespace(namespace);
+        Map<String, List<String>> index = podToServices(ns);
         Set<String> services = new LinkedHashSet<>();
+        log.info("[Topology] servicesOfDeployment 入口 deployment={} ns={} 索引大小={}",
+                deploymentName, ns, index.size());
         try {
             Deployment deployment = holder.client().apps().deployments()
-                    .inNamespace(holder.namespace()).withName(deploymentName).get();
-            if (deployment != null && deployment.getSpec() != null) {
-                for (Pod pod : holder.client().pods().inNamespace(holder.namespace())
-                        .withLabelSelector(deployment.getSpec().getSelector()).list().getItems()) {
-                    if (pod.getMetadata() == null) {
-                        continue;
+                    .inNamespace(ns).withName(deploymentName).get();
+            log.info("[Topology] 查询 Deployment ns={} name={} => found={}",
+                    ns, deploymentName, deployment != null);
+            if (deployment == null) {
+                log.warn("[Topology] Deployment 不存在 ns={} name={}，无法反查 Service", ns, deploymentName);
+                return new ArrayList<>();
+            }
+
+            // 路径一：Deployment 下所有 Pod（含 0 副本 = 空）通过 Pod 名反查。
+            List<Pod> pods = holder.client().pods().inNamespace(ns)
+                    .withLabelSelector(deployment.getSpec().getSelector()).list().getItems();
+            log.info("[Topology] 路径一 Pod 反查 ns={} deployment={} pods={} 个",
+                    ns, deploymentName, pods.size());
+            for (Pod pod : pods) {
+                if (pod.getMetadata() == null) {
+                    continue;
+                }
+                List<String> svcs = index.get(pod.getMetadata().getName());
+                log.debug("[Topology]   Pod {} => services={}", pod.getMetadata().getName(), svcs);
+                if (svcs != null) {
+                    services.addAll(svcs);
+                }
+            }
+
+            // 路径二：静态 label 匹配。0 副本部署没有 Pod，路径一必然为空；
+            // 改从 Service 侧直接看 selector 是否与 Deployment 的 template label 匹配。
+            if (services.isEmpty()) {
+                log.info("[Topology] 路径一未命中任何 Service（0 副本或无 Pod），进入路径二静态 label 匹配");
+                if (deployment.getSpec() != null
+                        && deployment.getSpec().getTemplate() != null
+                        && deployment.getSpec().getTemplate().getMetadata() != null
+                        && deployment.getSpec().getTemplate().getMetadata().getLabels() != null) {
+                    Map<String, String> templateLabels = deployment.getSpec().getTemplate().getMetadata().getLabels();
+                    log.info("[Topology] Deployment template labels = {}", templateLabels);
+                    List<io.fabric8.kubernetes.api.model.Service> allSvc =
+                            holder.client().services().inNamespace(ns).list().getItems();
+                    log.info("[Topology] ns={} 下共 {} 个 Service，开始静态匹配", ns, allSvc.size());
+                    for (io.fabric8.kubernetes.api.model.Service svc : allSvc) {
+                        if (svc.getMetadata() == null) {
+                            continue;
+                        }
+                        Map<String, String> selector = svc.getSpec() != null ? svc.getSpec().getSelector() : null;
+                        if (selector == null || selector.isEmpty()) {
+                            continue;
+                        }
+                        // selector 每个键值都必须在 template label 同名命中才算匹配
+                        boolean matches = selector.entrySet().stream()
+                                .allMatch(e -> Objects.equals(e.getValue(), templateLabels.get(e.getKey())));
+                        log.info("[Topology]   Service {} selector={} => 匹配={}", svc.getMetadata().getName(), selector, matches);
+                        if (matches) {
+                            services.add(svc.getMetadata().getName());
+                        }
                     }
-                    List<String> svcs = index.get(pod.getMetadata().getName());
-                    if (svcs != null) {
-                        services.addAll(svcs);
-                    }
+                } else {
+                    log.warn("[Topology] Deployment 无 template labels，静态匹配无法执行");
                 }
             }
         } catch (Exception e) {
-            log.debug("解析 Deployment 对应服务失败 deployment={}: {}", deploymentName, e.getMessage());
+            log.warn("解析 Deployment 对应服务失败 deployment={} ns={}: {}", deploymentName, ns, e.getMessage());
         }
+        log.info("[Topology] servicesOfDeployment 结果 deployment={} ns={} => {}",
+                deploymentName, ns, services);
         return new ArrayList<>(services);
     }
 
     /**
-     * Service 当前的端点健康度：就绪地址数 / 未就绪地址数。
+     * Service 当前的端点健康度：就绪地址数 / 未就绪地址数（默认 namespace）。
      * 「就绪为 0 且有未就绪」= 服务已断流，这是影响面分析里最关键的一个信号。
      */
     public Map<String, Object> serviceEndpointHealth(String serviceName) {
+        return serviceEndpointHealth(serviceName, null);
+    }
+
+    /**
+     * Service 当前的端点健康度，可指定 namespace。
+     * 「就绪为 0 且有未就绪」= 服务已断流。
+     */
+    public Map<String, Object> serviceEndpointHealth(String serviceName, String namespace) {
+        String ns = resolveNamespace(namespace);
         Map<String, Object> result = new LinkedHashMap<>();
         int ready = 0;
         int notReady = 0;
         try {
             Endpoints endpoints = holder.client().endpoints()
-                    .inNamespace(holder.namespace()).withName(serviceName).get();
+                    .inNamespace(ns).withName(serviceName).get();
             if (endpoints != null && endpoints.getSubsets() != null) {
                 for (EndpointSubset subset : endpoints.getSubsets()) {
                     ready += subset.getAddresses() != null ? subset.getAddresses().size() : 0;
@@ -322,9 +412,9 @@ public class TopologyService {
 
     // ---------------- 缓存 ----------------
 
-    private Map<String, List<String>> readCache() {
+    private Map<String, List<String>> readCache(String namespace) {
         try {
-            String json = redisTemplate.opsForValue().get(CACHE_PREFIX + holder.namespace());
+            String json = redisTemplate.opsForValue().get(CACHE_PREFIX + namespace);
             if (json == null || json.isBlank()) {
                 return null;
             }
@@ -335,10 +425,10 @@ public class TopologyService {
         }
     }
 
-    private void writeCache(Map<String, List<String>> topology) {
+    private void writeCache(String namespace, Map<String, List<String>> topology) {
         try {
             redisTemplate.opsForValue().set(
-                    CACHE_PREFIX + holder.namespace(),
+                    CACHE_PREFIX + namespace,
                     MAPPER.writeValueAsString(topology),
                     Duration.ofSeconds(Math.max(5, cacheSeconds)));
         } catch (Exception e) {

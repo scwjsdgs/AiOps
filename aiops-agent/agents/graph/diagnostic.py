@@ -22,6 +22,7 @@
 """
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph, START, END
 
 from config import config
@@ -80,10 +81,12 @@ async def _diagnostic_inner(state: AgentState) -> dict:
     max_rounds = min(config.AGENT_MAX_ITERATIONS, 6)
     used_signatures = set()
 
+    writer = get_stream_writer()
     for _ in range(max_rounds):
         # 滑动窗口 + 兜底清洗：裁剪超出窗口的旧消息，并剔除被切断的孤儿
         # ToolMessage / 未配对 tool_calls，避免脏数据污染 LLM 上下文。
         messages = sanitize_messages(trim_worker_messages(messages, config.MESSAGES_WINDOW_SIZE))
+        writer({"type": "progress", "content": "诊断 Agent 正在理解问题并规划排查步骤"})
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
         tool_calls = getattr(response, "tool_calls", None) or []
@@ -105,11 +108,14 @@ async def _diagnostic_inner(state: AgentState) -> dict:
                 if func is None:
                     observation = f"未知工具：{name}"
                 else:
+                    writer({"type": "tool_call", "name": name, "args": args})
+                    writer({"type": "progress", "content": f"正在调用 {name} 排查"})
                     await callback_service.send_step(task_id, f"诊断 Agent 调用 {name}", f"diagnostic_{name}")
                     try:
                         observation = await func.ainvoke(args)
                     except Exception as e:
                         observation = f"工具执行失败：{e}"
+                    writer({"type": "tool_result", "name": name, "content": str(observation)[:500]})
                 evidence.append({"tool": name, "args": args, "observation": observation})
             messages.append(ToolMessage(
                     content=str(observation), tool_call_id=tc["id"]

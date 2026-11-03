@@ -34,30 +34,56 @@ public class ImpactAnalysisService {
     private final KubernetesToolClientHolder holder;
 
     /**
-     * 分析某个 Deployment 的故障影响面。
+     * 分析某个 Deployment 的故障影响面（使用默认 namespace）。
      *
      * @param deploymentName 故障服务名。找不到时返回 available=false 而非抛异常 ——
      *                       「查不到」是个事实，交给调用方决定怎么展示。
      */
     public Map<String, Object> analyze(String deploymentName) {
+        return analyze(deploymentName, null);
+    }
+
+    /**
+     * 分析某个 Deployment 的故障影响面。
+     *
+     * @param deploymentName 故障服务名。找不到时返回 available=false 而非抛异常 ——
+     *                       「查不到」是个事实，交给调用方决定怎么展示。
+     * @param namespace      目标 namespace；null/空白时回退到默认配置。
+     */
+    public Map<String, Object> analyze(String deploymentName, String namespace) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("deployment", deploymentName);
+        log.info("[ImpactAnalysis] analyze 入口 deployment={} namespaceParam={}", deploymentName, namespace);
 
         // 先校验参数，再去碰集群：名字都没给就没必要发起任何 K8s 调用
         if (deploymentName == null || deploymentName.isBlank()) {
+            log.warn("[ImpactAnalysis] 未提供 deployment 名称，返回不可用");
             result.put("available", false);
             result.put("reason", "未提供 deployment 名称");
             return result;
         }
-        result.put("namespace", holder.namespace());
+        String ns = (namespace == null || namespace.isBlank()) ? holder.namespace() : namespace.trim();
+        result.put("namespace", ns);
+        log.info("[ImpactAnalysis] 解析命名空间 => ns={}（默认配置 default={}）", ns, holder.namespace());
 
         try {
             Deployment deployment = holder.client().apps().deployments()
-                    .inNamespace(holder.namespace()).withName(deploymentName).get();
+                    .inNamespace(ns).withName(deploymentName).get();
+            log.info("[ImpactAnalysis] 查询 Deployment ns={} name={} => found={}",
+                    ns, deploymentName, deployment != null);
             if (deployment == null) {
+                log.warn("[ImpactAnalysis] Deployment 不存在 ns={} name={}", ns, deploymentName);
                 result.put("available", false);
                 result.put("reason", "Deployment 不存在：" + deploymentName);
                 return result;
+            }
+            if (deployment.getSpec() != null && deployment.getSpec().getTemplate() != null
+                    && deployment.getSpec().getTemplate().getMetadata() != null) {
+                log.debug("[ImpactAnalysis] Deployment template labels = {}",
+                        deployment.getSpec().getTemplate().getMetadata().getLabels());
+            }
+            if (deployment.getSpec() != null && deployment.getSpec().getSelector() != null) {
+                log.debug("[ImpactAnalysis] Deployment selector = {}", deployment.getSpec().getSelector());
             }
 
             // 1. 自身健康度
@@ -71,13 +97,19 @@ public class ImpactAnalysisService {
             result.put("readyReplicas", ready);
             result.put("unavailableReplicas", unavailable);
             result.put("selfDegraded", unavailable > 0 || (desired > 0 && ready < desired));
+            log.info("[ImpactAnalysis] 自身健康度 ns={} name={} desired={} ready={} unavailable={}",
+                    ns, deploymentName, desired, ready, unavailable);
 
             // 2. 受影响的 Service（流量入口）
-            List<String> services = topologyService.servicesOfDeployment(deploymentName);
+            List<String> services = topologyService.servicesOfDeployment(deploymentName, ns);
+            log.info("[ImpactAnalysis] servicesOfDeployment(ns={}, name={}) => {}",
+                    ns, deploymentName, services);
             List<Map<String, Object>> serviceImpacts = new ArrayList<>();
             boolean anyOutage = false;
             for (String svc : services) {
-                Map<String, Object> health = topologyService.serviceEndpointHealth(svc);
+                Map<String, Object> health = topologyService.serviceEndpointHealth(svc, ns);
+                log.info("[ImpactAnalysis] service {} 端点健康度 => ready={} notReady={} outage={}",
+                        svc, health.get("readyEndpoints"), health.get("notReadyEndpoints"), health.get("outage"));
                 // 断流是最严重的信号：有实例但全部不可用，业务流量此刻已经中断
                 anyOutage = anyOutage || Boolean.TRUE.equals(health.get("outage"));
                 serviceImpacts.add(health);
@@ -89,8 +121,15 @@ public class ImpactAnalysisService {
             // 3. 受影响 Pod 明细（未就绪的挑出来，这是"哪些实例在拖后腿"的直接答案）
             List<Map<String, Object>> affectedPods = new ArrayList<>();
             try {
-                List<Pod> pods = holder.client().pods().inNamespace(holder.namespace())
+                List<Pod> pods = holder.client().pods().inNamespace(ns)
                         .withLabelSelector(deployment.getSpec().getSelector()).list().getItems();
+                log.info("[ImpactAnalysis] 查询关联 Pod ns={} selector={} => {} 个",
+                        ns, deployment.getSpec().getSelector(), pods.size());
+                for (Pod pod : pods) {
+                    log.debug("[ImpactAnalysis] Pod {} phase={} ready={}", pod.getMetadata().getName(),
+                            pod.getStatus() != null ? pod.getStatus().getPhase() : "unknown",
+                            isPodReady(pod));
+                }
                 for (Pod pod : pods) {
                     Map<String, Object> item = new LinkedHashMap<>();
                     item.put("pod", pod.getMetadata().getName());

@@ -31,6 +31,8 @@ SUPERVISOR_SYSTEM_PROMPT = """你是 AIOps Multi-Agent 编排主管（Supervisor
 3. executor 完成后必须回到 diagnostic 做修复后验证；验证通过再进 reporter。
 4. reporter 输出最终报告后，由本 Supervisor 判断是否结束。
 5. 不要在你的输出里编造集群事实，也不要直接执行工具。
+6. 若是 ChatOps 交互诊断（仅排查与知识库问答），永远不要路由 executor，
+   诊断完成直接进 reporter，不申请任何人工审批。
 
 输出格式：
 NEXT_AGENT=<diagnostic|executor|reporter|end>
@@ -47,6 +49,29 @@ async def supervisor_node(state: AgentState) -> dict:
     evidence = state.get("evidence", [])
     execution_results = state.get("execution_results", [])
     report = state.get("report")
+
+    # 硬性防死循环：iteration_count / supervisor_round 任一达到上限后不再路由
+    # diagnostic/executor，一律强制进 reporter 收束，避免恢复审批后绕圈直到
+    # recursion_limit。threshold 与 graph._should_force_report 保持一致。
+    iteration_count = state.get("iteration_count") or 0
+    supervisor_round = state.get("supervisor_round") or 0
+    threshold = min(config.MAX_ITERATION_ROUNDS, config.AGENT_MAX_ITERATIONS)
+    if report:
+        return {"next_agent": "end", "plan": "报告已完成，结束任务"}
+    if iteration_count >= threshold or supervisor_round >= threshold:
+        return {
+            "next_agent": "reporter",
+            "plan": f"已达到最大迭代 {threshold} 次，强制生成报告收束",
+            "supervisor_round": supervisor_round + 1,
+        }
+
+    # ChatOps 是只读统一交互入口：仅诊断 + RAG，任何情况下都不走执行/审批。
+    if state.get("chatops"):
+        if report:
+            return {"next_agent": "end", "plan": "报告已完成，结束任务"}
+        if not root_cause and "diagnostic" not in completed:
+            return {"next_agent": "diagnostic", "plan": "诊断 Agent 收集证据并定位根因"}
+        return {"next_agent": "reporter", "plan": "报告 Agent 汇总证据"}
 
     # 根据图进度决定下一步，不需要每次都让 LLM 重读全部工具输出。
     if report:
@@ -91,10 +116,20 @@ def _needs_repair(state: AgentState) -> bool:
     if not _evidence_indicates_failure(state):
         return False
     root_cause = (state.get("root_cause") or "").lower()
+    # 强制拦截误报：诊断结论明确说“无需修复/误报/噪声/假告警”时，绝对不进 Executor。
+    no_repair_markers = ("误报", "无需修复", "无需处理", "不需要修复", "噪声", "假告警",
+                         "无真实故障", "not a real", "false alarm", "无需介入",
+                         "低基数", "基线噪声", "统计噪声", "无异常", "服务正常", "未发现故障",
+                         # 证据不足/无法确认根因同样不能进 Executor —— 没定位到根因
+                         # 就无法给出可信修复，交由报告 Agent 提示人工介入。
+                         "证据不足", "无法确认", "无法确认根因", "不存在", "not found",
+                         "无法验证", "无法判断", "未发现根因")
+    if any(m in root_cause for m in no_repair_markers):
+        return False
     keywords = (
         "crash", "imagepull", "imagepullbackoff", "crashloopbackoff", "oom",
         "oomkilled", "失败", "异常", "重启", "回滚", "扩容", "缩容",
-        "断流", "unhealthy", "not ready", "notready",
+        "已断流", "unhealthy", "not ready", "notready",
     )
     return any(k in root_cause for k in keywords)
 
@@ -113,15 +148,13 @@ def _evidence_indicates_failure(state: AgentState) -> bool:
             )):
                 return True
         elif tool == "query_impact":
-            # “未就绪 0”不算异常；只有明确出现断流/outage/异常实例，
-            # 或“未就绪 N”的 N > 0 时才判定受影响。
-            if any(marker in obs for marker in (
-                    "已断流", "断流", "outage", "异常实例",
-                    "业务流量当前中断", "未就绪 1", "未就绪 2", "未就绪 3",
-                    "未就绪 4", "未就绪 5", "未就绪 6", "未就绪 7",
-                    "未就绪 8", "未就绪 9",
-            )):
+            # “未断流”不等于“断流”，绝不能因为文本里出现“断流”二字就误判。
+            # 只有明确出现“已断流/outage/异常实例/未就绪 N(N>0)”才判定受影响。
+            if "已断流" in obs or "outage" in obs or "异常实例" in obs:
                 return True
+            for i in range(1, 20):
+                if f"未就绪 {i}" in obs:
+                    return True
         elif tool == "query_pod_events":
             if any(marker in obs for marker in (
                     "crashloopbackoff", "imagepullbackoff", "oomkilled",

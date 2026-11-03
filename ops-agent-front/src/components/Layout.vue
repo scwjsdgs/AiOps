@@ -78,9 +78,11 @@
 
       <el-main class="main">
         <router-view v-slot="{ Component }">
-          <!-- 路由切换淡入，避免整页闪烁 -->
+          <!-- 路由切换淡入，避免整页闪烁；ChatOps 保持缓存，切页回来不重新灌历史 -->
           <transition name="fade-slide" mode="out-in">
-            <component :is="Component" :key="route.path" />
+            <KeepAlive include="ChatOps">
+              <component :is="Component" :key="route.path" />
+            </KeepAlive>
           </transition>
         </router-view>
       </el-main>

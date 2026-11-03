@@ -41,3 +41,24 @@ def submit(task_id: str, coro_factory) -> str:
 def is_running(task_id: str) -> bool:
     task = _inflight.get(task_id)
     return task is not None and not task.done()
+
+
+def cancel(task_id: str) -> bool:
+    """取消在飞任务；不存在或已完成返回 False。"""
+    task = _inflight.get(task_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    logger.info("已发送取消信号 task=%s", task_id)
+    return True
+
+
+def cancel_all() -> int:
+    """取消全部在飞任务（服务关闭或运维演练用），返回取消数量。"""
+    canceled = 0
+    for task_id, task in list(_inflight.items()):
+        if task is not None and not task.done():
+            task.cancel()
+            canceled += 1
+            logger.info("已发送取消信号 task=%s", task_id)
+    return canceled

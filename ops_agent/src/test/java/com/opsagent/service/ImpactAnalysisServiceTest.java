@@ -25,6 +25,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
@@ -80,8 +81,8 @@ class ImpactAnalysisServiceTest {
         stubPods(deployment, List.of());
 
         // 入口已断流：就绪端点为 0，但有 2 个未就绪端点
-        when(topologyService.servicesOfDeployment("leaky-app")).thenReturn(List.of("leaky-app"));
-        when(topologyService.serviceEndpointHealth("leaky-app"))
+        when(topologyService.servicesOfDeployment(eq("leaky-app"), anyString())).thenReturn(List.of("leaky-app"));
+        when(topologyService.serviceEndpointHealth(eq("leaky-app"), anyString()))
                 .thenReturn(Map.of("service", "leaky-app", "readyEndpoints", 0,
                         "notReadyEndpoints", 2, "outage", true));
 
@@ -100,8 +101,8 @@ class ImpactAnalysisServiceTest {
         stubDeploymentLookup(deployment);
         stubPods(deployment, List.of());
 
-        when(topologyService.servicesOfDeployment("nginx")).thenReturn(List.of("nginx"));
-        when(topologyService.serviceEndpointHealth("nginx"))
+        when(topologyService.servicesOfDeployment(eq("nginx"), anyString())).thenReturn(List.of("nginx"));
+        when(topologyService.serviceEndpointHealth(eq("nginx"), anyString()))
                 .thenReturn(Map.of("service", "nginx", "readyEndpoints", 2,
                         "notReadyEndpoints", 0, "outage", false));
 

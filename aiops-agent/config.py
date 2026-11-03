@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     KAFKA_GROUP_ID: str = os.getenv("KAFKA_GROUP_ID", "aiops-python-tool-group")
     # Kafka 请求发出后等待结果的超时（秒）。超时后视为异常并自动回退 HTTP。
     KAFKA_CALLBACK_TIMEOUT_SECONDS: float = float(os.getenv("KAFKA_CALLBACK_TIMEOUT_SECONDS", "30"))
+    # 文档系统变更事件 topic：Java Webhook 发送，Python 消费后切片/embedding/upsert/软删除。
+    KAFKA_DOC_CHANGE_TOPIC: str = os.getenv("KAFKA_DOC_CHANGE_TOPIC", "doc-change")
+    KAFKA_DOC_CHANGE_GROUP_ID: str = os.getenv("KAFKA_DOC_CHANGE_GROUP_ID", "aiops-doc-change-group")
 
     # LangFuse 可观测性（默认关闭，配置齐了自动启用）
     LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() in ("1", "true", "yes", "on")

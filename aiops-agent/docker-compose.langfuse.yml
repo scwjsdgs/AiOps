@@ -34,6 +34,12 @@ services:
       LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?请在 .env 中配置 MINIO_ROOT_PASSWORD}
       LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
       LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      # ⚠️ 优化：限制 Node.js 堆内存
+      NODE_OPTIONS: --max-old-space-size=1024
+    deploy:
+      resources:
+        limits:
+          memory: 1536M # ⚠️ 优化：硬限制最大内存 1.5G
     depends_on:
       - postgres
       - clickhouse
@@ -79,6 +85,12 @@ services:
       LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?请在 .env 中配置 MINIO_ROOT_PASSWORD}
       LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
       LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      # ⚠️ 优化：限制 Node.js 堆内存
+      NODE_OPTIONS: --max-old-space-size=1024
+    deploy:
+      resources:
+        limits:
+          memory: 1536M # ⚠️ 优化：硬限制最大内存 1.5G
 
   postgres:
     image: postgres:16
@@ -89,6 +101,10 @@ services:
       POSTGRES_DB: langfuse
     volumes:
       - langfuse-postgres-data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M # ⚠️ 优化：数据库一般 512M 够用
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -98,6 +114,8 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在 .env 中配置 CLICKHOUSE_PASSWORD}
+      # ⚠️ 优化：限制 ClickHouse 最大服务内存为 2GB
+      CLICKHOUSE_MAX_SERVER_MEMORY_USAGE: 2000000000 
     volumes:
       - langfuse-clickhouse-data:/var/lib/clickhouse
     healthcheck:
@@ -105,6 +123,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 2560M # ⚠️ 优化：硬限制 2.5G（留一点余量给系统缓存）
 
   # MinIO 对象存储
   minio:
@@ -121,6 +143,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 512M # ⚠️ 优化：对象存储限制
 
   # 初始化 S3 bucket（LangFuse v3 不会自动创建，必须显式建桶）
   minio-init:

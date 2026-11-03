@@ -82,20 +82,31 @@ public class MetricService {
 
     /**
      * 一次返回多个常用指标，供 Dashboard 大盘直接渲染：
-     * - network ok/元信息
+     * - Prometheus 可达状态；cAdvisor 目标状态单独回报，便于前端区分“Prometheus 挂了”
+     *   和“只是容器指标没采集”
      * - 各 Deployment 的就绪/期望副本（kube-state-metrics，一定有）
      * - 各 Deployment 的容器 CPU(cores) / 内存(bytes)（container_*，依赖 cAdvisor）
+     *
+     * cAdvisor down 时容器 CPU/内存为空，但不影响副本/集群健康卡片。
      */
     public Map<String, Object> overview() {
         Map<String, Object> result = new LinkedHashMap<>();
         // up{job="prometheus"} 能查到 = Prometheus 本体可达；null 视为未连通
-        result.put("connected", query("up{job=\"prometheus\"}") != null);
+        List<Map<String, Object>> upRows = query("up{job=\"prometheus\"}");
+        result.put("connected", upRows != null);
+
+        List<Map<String, Object>> cAdvisorUp = query("up{job=\"cAdvisor\"}");
+        result.put("cadvisorConnected", isUp(cAdvisorUp));
+
         result.put("deploymentReplicas", query("kube_deployment_status_replicas_available"));
         result.put("deploymentReplicasDesired", query("kube_deployment_spec_replicas"));
-        result.put("containerCpu", query(
-                "sum(rate(container_cpu_usage_seconds_total{container!=\"POD\",image!=\"\"}[3m])) by (pod)"));
-        result.put("containerMemory", query(
-                "sum(container_memory_working_set_bytes{container!=\"POD\",image!=\"\"}) by (pod)"));
+        List<Map<String, Object>> cpu = query(
+                "sum(rate(container_cpu_usage_seconds_total{container!=\"POD\",image!=\"\"}[3m])) by (pod)");
+        List<Map<String, Object>> memory = query(
+                "sum(container_memory_working_set_bytes{container!=\"POD\",image!=\"\"}) by (pod)");
+        result.put("containerCpu", cpu);
+        result.put("containerMemory", memory);
+        result.put("containerMetricsAvailable", cpu != null && !cpu.isEmpty() && memory != null && !memory.isEmpty());
         return result;
     }
 
@@ -105,5 +116,26 @@ public class MetricService {
         } catch (Exception e) {
             return query;
         }
+    }
+
+    /** Prometheus value 形如 [timestamp, "1"]，这里只取字符串值判断目标是否 up。 */
+    static boolean isUp(List<Map<String, Object>> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return false;
+        }
+        for (Map<String, Object> row : rows) {
+            Object value = row.get("value");
+            Object raw = null;
+            if (value instanceof List<?> list && list.size() >= 2) {
+                raw = list.get(1);
+            } else if (value != null) {
+                // MetricService.query 为了兼容旧调用方，把 value 转成了字符串 "1"
+                raw = value;
+            }
+            if (raw != null && !"0".equals(String.valueOf(raw))) {
+                return true;
+            }
+        }
+        return false;
     }
 }

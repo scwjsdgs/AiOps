@@ -18,6 +18,7 @@ from config import config
 from rag.dashscope_embeddings import DashScopeEmbeddings
 from rag.knowledge_meta import (
     ACTIVE,
+    DISABLED,
     append_audit,
     get_document,
     list_audit,
@@ -78,7 +79,8 @@ def _current_chunks(store, source: str) -> list:
         collection = getattr(store, "_collection", None)
         if collection is None:
             return [], []
-        data = collection.get(where={"source": source}, include=["documents", "metadatas", "ids"])
+        # Chroma get 的 include 只接受 documents/embeddings/metadatas 等，ids 是返回体固定字段
+        data = collection.get(where={"source": source}, include=["documents", "metadatas"])
         docs = data.get("documents") or []
         ids = data.get("ids") or []
         return docs, ids
@@ -129,6 +131,7 @@ def upload_document(content: str, filename: str, operator: str = "system",
                 "version": registered.get("version", ""),
                 "doc_id": registered.get("source", filename),
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "status": ACTIVE,
             } for _ in chunks]
             ids = [f"{filename}-{_simple_hash(chunk)}-{i}" for i, chunk in enumerate(chunks)]
             store.add_texts(texts=chunks, metadatas=metadatas, ids=ids)
@@ -190,6 +193,72 @@ def delete_document(source: str, operator: str = "system") -> dict:
         return {"ok": True, "removed_chunks": len(old_ids)}
     except Exception as e:
         append_audit("delete_failed", source, {"error": str(e), "operator": operator})
+        return {"ok": False, "reason": str(e)}
+
+
+def soft_delete_document(source: str, operator: str = "system") -> dict:
+    """软删除文档：保留 Chroma 数据，把该 source 的 chunk metadata 更新为 DISABLED。
+
+    数据库层检索 where={"status": {"$ne": "DISABLED"}} 会自然过滤这些 chunk。
+    元数据文件同步标记 DISABLED，版本历史仍保留可回滚。
+    """
+    source = _safe_filename(source)
+    try:
+        store = _build_store()
+        old_docs, old_ids = _current_chunks(store, source)
+        if old_ids:
+            # 更新而不是删除：让 Chroma 数据库层过滤，保留审计/版本可回滚
+            store._collection.update(
+                ids=old_ids,
+                metadatas=[{"status": "DISABLED"} for _ in old_ids],
+            )
+            if hasattr(store, "persist"):
+                store.persist()
+        meta = load_meta()
+        doc = meta.get("documents", {}).get(source)
+        if doc:
+            doc["status"] = DISABLED
+            doc["deleted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            doc["operator"] = operator
+            _save_meta(meta)
+            append_audit("soft_delete", source, {
+                "operator": operator,
+                "version": doc.get("version", ""),
+                "disabled_chunks": len(old_ids),
+            })
+        else:
+            # 文档从未上传过也允许打软删除，避免脏事件阻塞链路
+            append_audit("soft_delete_missing", source, {"operator": operator})
+        return {"ok": True, "source": source, "soft_deleted": True, "disabled_chunks": len(old_ids)}
+    except Exception as e:
+        append_audit("soft_delete_failed", source, {"error": str(e), "operator": operator})
+        return {"ok": False, "reason": str(e)}
+
+
+def restore_document(source: str, operator: str = "system") -> dict:
+    """恢复软删除文档：Chroma chunk metadata 改回 ACTIVE，元数据文件同步。"""
+    source = _safe_filename(source)
+    try:
+        store = _build_store()
+        _old_docs, old_ids = _current_chunks(store, source)
+        if old_ids:
+            store._collection.update(
+                ids=old_ids,
+                metadatas=[{"status": ACTIVE} for _ in old_ids],
+            )
+            if hasattr(store, "persist"):
+                store.persist()
+        meta = load_meta()
+        doc = meta.get("documents", {}).get(source)
+        if doc:
+            doc["status"] = ACTIVE
+            doc["deleted_at"] = ""
+            doc["operator"] = operator
+            _save_meta(meta)
+            append_audit("restore", source, {"operator": operator, "chunks": len(old_ids)})
+        return {"ok": True, "source": source, "restored_chunks": len(old_ids)}
+    except Exception as e:
+        append_audit("restore_failed", source, {"error": str(e), "operator": operator})
         return {"ok": False, "reason": str(e)}
 
 

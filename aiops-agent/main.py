@@ -72,13 +72,18 @@ async def log_requests_middleware(request: Request, call_next):
 
     # 读取请求体大小（不消费流）
     body = await request.body()
-    logger.info(f"Request: {request.method} {request.url.path} | BodySize: {len(body)} bytes")
+    # ChatOps SSE 属于长连接且会有高频事件，正常对话时不必在控制台打印
+    # Request/Response 日志（之前会误以为“后台狂刷”）。保留普通接口 INFO，
+    # SSE 连接改为 DEBUG，便于按需排查。
+    is_stream = request.url.path == "/api/agent/stream"
+    log_method = logger.debug if is_stream else logger.info
+    log_method(f"Request: {request.method} {request.url.path} | BodySize: {len(body)} bytes")
 
     response = await call_next(request)
 
     process_time = time.perf_counter() - start_time
     request_id = getattr(request.state, "request_id", "N/A")
-    logger.info(
+    log_method(
         f"Response: {request.method} {request.url.path} | "
         f"Status: {response.status_code} | "
         f"Duration: {process_time:.3f}s | "
@@ -122,12 +127,14 @@ class StartRequest(BaseModel):
     severity: str = "CRITICAL"
     host: str = "unknown"
     detail: str = ""
+    readonly: bool = False
 
 
 class StreamRequest(BaseModel):
     taskId: str
     message: str
     sessionId: str = ""
+    history: list = []
 
 
 # ============================================================
@@ -154,6 +161,7 @@ async def start_agent(request: StartRequest):
         serviceName=request.serviceName,
         host=request.host,
         detail=request.detail,
+        readonly=request.readonly,
     )
     logger.info(f"收到 agent 启动请求，task={task_id}")
 
@@ -167,6 +175,28 @@ async def start_agent(request: StartRequest):
     )
 
 
+def _build_history_override(rows: list) -> dict:
+    """把 Java Redis Memory 的 [{role, content}] 转成 LangGraph history。
+
+    Java 网关只取最近 5 轮，Python 不再额外依赖 Redis，避免跨语言状态分叉。
+    """
+    if not rows:
+        return {}
+    from langchain_core.messages import HumanMessage, AIMessage
+    messages = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "user")
+        content = str(row.get("content") or "").strip()
+        if not content:
+            continue
+        messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
+    if not messages:
+        return {}
+    return {"messages": messages}
+
+
 @app.post("/api/agent/stream")
 async def stream_agent(request: StreamRequest):
     task_id = request.taskId
@@ -176,9 +206,11 @@ async def stream_agent(request: StreamRequest):
 
     async def event_generator():
         try:
-            # ChatOps 直接把 session_id 作为 LangGraph thread_id：同一会话
-            # 的历史状态从 Checkpointer 恢复，跨页面/刷新也可继续追问。
-            async for event in run_react_loop(task_id, user_msg, thread_id=session_id):
+            # Java 网关传入 Redis 最近 5 轮上下文（user/assistant dict），
+            # 转成 LangGraph BaseMessage 后作为 history_override。
+            history = _build_history_override(request.history)
+            async for event in run_react_loop(task_id, user_msg, thread_id=session_id,
+                                              history_override=history):
                 # event 本身不带换行，这里统一拼 SSE 帧
                 yield f"data: {event}\n\n"
                 data = json.loads(event)
@@ -188,6 +220,10 @@ async def stream_agent(request: StreamRequest):
                     await callback_service.send_step(task_id, "等待人工审批（LangGraph 已挂起）", "awaiting_approval")
                     yield f"data: {json.dumps({'type': 'action', 'data': {'tool': 'request_human_approval', 'args': data.get('data', {})}}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'end', 'data': '流式处理完成'}, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            # 前端或 Java 断开连接时立刻停止，不再把整张图跑完，避免后台持续刷日志。
+            logger.info("ChatOps 流式连接已断开，任务终止 task=%s", task_id)
+            raise
         except Exception as e:
             from langgraph.errors import GraphRecursionError
             message = str(e) or "未知错误"
@@ -239,6 +275,26 @@ async def chatops_get_session(session_id: str, username: str = "unknown"):
         "updated_at": state.get("completed_at") or "",
     }
     return {"ok": True, "data": history}
+
+
+@app.delete("/api/chatops/sessions/{session_id}")
+async def chatops_delete_session(request: Request, session_id: str, username: str = "unknown"):
+    """删除 ChatOps 会话的 LangGraph checkpoint。
+
+    用户归属校验由 Java 代理层完成（按 JWT username + Redis 会话索引）；
+    这里只负责真正清掉 Python 侧持久化历史，避免用户删除后刷新又恢复。
+    """
+    token = request.headers.get("X-Internal-Token", "")
+    if not hmac.compare_digest(token, config.JAVA_INTERNAL_TOKEN):
+        raise HTTPException(status_code=401, detail="invalid internal token")
+    from agents.graph.checkpointer import get_checkpointer
+    try:
+        await get_checkpointer().adelete_thread(session_id)
+        logger.info("ChatOps 会话历史已删除 session_id=%s", session_id)
+        return {"ok": True, "data": {"session_id": session_id}}
+    except Exception as e:
+        logger.exception("删除 ChatOps 会话历史失败 session_id=%s: %s", session_id, e)
+        raise HTTPException(status_code=500, detail=f"删除会话失败: {e}")
 
 
 @app.get("/health")
@@ -463,6 +519,22 @@ class ResumeRequest(BaseModel):
     note: str = ""
 
 
+@app.post("/api/agent/cancel/{task_id}")
+async def cancel_agent_task(task_id: str):
+    """Java 前端断线/超时后调用，立即取消当前在飞的 LangGraph 任务。
+
+    取消信号本身不直接改 Redis 任务状态：Java 侧会在断开时同步把任务落成
+    明确的 FAILED/取消状态，避免任务在 Redis 里永远停在 RUNNING。
+    """
+    from services.task_runner import cancel
+    canceled = cancel(task_id)
+    if canceled:
+        logger.info("ChatOps 任务已取消 task=%s", task_id)
+    else:
+        logger.info("ChatOps 取消请求到达，但任务不在飞 task=%s", task_id)
+    return {"status": "canceled" if canceled else "idle", "task_id": task_id, "cancelled": canceled}
+
+
 @app.post("/api/agent/resume/{task_id}")
 async def resume_agent_task(request: Request, task_id: str, req: ResumeRequest):
     """Java 审批决定后调用，恢复被 interrupt() 挂起的 LangGraph 任务。
@@ -541,8 +613,13 @@ async def scheduled_health_check():
 
 @app.on_event("startup")
 async def startup_event():
-    """服务启动时，启动 Kafka 工具通道、后台巡检任务，并预热向量库"""
+    """服务启动时，启动 Kafka 工具通道、文档变更消费者、后台巡检，并预热向量库"""
     await kafka_tool_callback.start()
+    try:
+        from services.doc_change_consumer import doc_change_consumer
+        await doc_change_consumer.start()
+    except Exception as e:
+        logger.warning("文档变更 Kafka 消费者启动失败（RAG 事件更新降级）: %s", e)
     if config.HEALTH_CHECK_ENABLED:
         asyncio.create_task(scheduled_health_check())
         interval = config.HEALTH_CHECK_INTERVAL_HOURS
@@ -557,7 +634,12 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("服务关闭，停止 Kafka 工具调用通道")
+    logger.info("服务关闭，停止 Kafka 工具调用通道与文档变更消费者")
+    try:
+        from services.doc_change_consumer import doc_change_consumer
+        await doc_change_consumer.stop()
+    except Exception as e:
+        logger.warning("停止文档变更消费者异常: %s", e)
     await kafka_tool_callback.stop()
 
 

@@ -72,8 +72,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
-import { getRootCauseGraph, getSimilarTasks } from '@/api/intelligence'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { getRootCauseGraph, getSimilarTasks, getTaskDetail } from '@/api/intelligence'
 import * as echarts from 'echarts'
 import { Connection, Search, Refresh, List } from '@element-plus/icons-vue'
 
@@ -100,42 +100,194 @@ const loadGraph = async () => {
   }
 }
 
+let graphChart = null
+
+let expandedStepNodes = []
+
 const renderGraph = (data) => {
   nextTick(() => {
     if (!graphRef.value) return
-    const chart = echarts.init(graphRef.value)
+    if (graphChart) {
+      graphChart.dispose()
+      graphChart = null
+    }
+    graphChart = echarts.init(graphRef.value)
+    // 颜色与图例严格对齐：service 蓝、alert 绿、step 深色、task 橙。
     const color = {
       service: '#2563eb',
-      alert: '#ef4444',
-      step: '#10b981',
-      task: '#f59e0b'
+      alert: '#10b981',
+      step: '#334155',
+      task: '#f97316'
     }
-    const nodes = (data.nodes || []).map(n => ({
-      id: n.id,
-      name: n.name,
-      category: n.category,
-      symbolSize: n.category === 'service' ? 50 : n.category === 'alert' ? 38 : 30,
-      itemStyle: { color: color[n.category] || '#64748b' },
-      value: n.label || n.name
-    }))
-    chart.setOption({
-      tooltip: { formatter: (p) => p.dataType === 'edge' ? '' : `<b>${p.name}</b><br/>${p.data.value || ''}` },
-      legend: { data: ['service', 'alert', 'step', 'task'], bottom: 0 },
-      series: [{
-        type: 'graph',
-        layout: 'force',
-        roam: true,
-        draggable: true,
-        label: { show: true, fontSize: 11, color: '#1e293b' },
-        force: { repulsion: 320, edgeLength: 110, gravity: 0.08 },
-        edgeSymbol: ['none', 'arrow'],
-        lineStyle: { color: '#cbd5e1', width: 1.2, curveness: 0.08 },
-        categories: [
-          { name: 'service' }, { name: 'alert' }, { name: 'step' }, { name: 'task' }
-        ],
-        data: nodes,
-        links: (data.links || []).map(l => ({ source: l.source, target: l.target }))
-      }]
+
+    // 节点名统一截断，tooltip 里再给完整 label
+    const shortName = (s) => {
+      const str = String(s || '')
+      return str.length > 8 ? `${str.slice(0, 8)}…` : str
+    }
+
+    // 基础主干节点：服务、告警、任务。步骤默认折叠，点击任务节点再展开。
+    const baseNodes = (data.nodes || []).filter(n => n.category !== 'step')
+    const nodes = baseNodes.map(n => {
+      const category = n.category
+      const symbolSize = category === 'service' ? 60
+        : category === 'task' ? 42
+        : category === 'alert' ? 36
+        : 16
+      return {
+        id: n.id,
+        name: shortName(n.name),
+        fullName: n.name,
+        category,
+        symbolSize,
+        itemStyle: { color: color[category] || '#64748b' },
+        value: n.label || n.fullName || n.name,
+        nodeType: category,
+        steps: n.steps || [],
+        expanded: false,
+        taskId: category === 'task' ? String(n.id || '').replace(/^task:/, '') : ''
+      }
+    })
+    const idToNode = new Map(nodes.map(n => [n.id, n]))
+
+    // 默认只保留主干边，避免步骤边挤占图。
+    const ids = new Set(nodes.map(n => n.id))
+    const links = (data.links || [])
+      .filter(l => ids.has(l.source) && ids.has(l.target))
+      .map(l => ({ source: l.source, target: l.target }))
+
+    const truncateLabel = (s, max = 8) => {
+      const str = String(s || '')
+      return str.length > max ? `${str.slice(0, max)}…` : str
+    }
+
+    const renderOption = (nodeList, linkList) => {
+      graphChart.setOption({
+        color: [color.service, color.alert, color.task, color.step],
+        tooltip: {
+          confine: true,
+          maxWidth: 300,
+          extraCssText: 'white-space: normal; word-break: break-all; box-shadow: 0 0 3px rgba(0, 0, 0, 0.3);',
+          formatter: (p) => {
+            if (p.dataType === 'edge') return ''
+            const full = p.data.fullName || p.data.value || p.name
+            return `<b>${p.name}</b><br/>${full}`
+          }
+        },
+        legend: { data: ['service', 'alert', 'task', 'step'], bottom: 0 },
+        series: [{
+          type: 'graph',
+          layout: 'force',
+          roam: true,
+          draggable: true,
+          label: {
+            show: true,
+            fontSize: 11,
+            color: '#1e293b',
+            formatter: (p) => {
+              if (!p.data || p.dataType === 'edge') return ''
+              const d = p.data
+              if (d.category === 'alert') return `告警 ${d.name}`
+              if (d.category === 'step') return truncateLabel(d.name, 8)
+              return d.name
+            }
+          },
+          // 固定 force，步骤节点围绕任务节点呈葡萄状，不切 circular，避免星环。
+          force: {
+            repulsion: 800,
+            edgeLength: 150,
+            gravity: 0.08,
+            friction: 0.15,
+            layoutAnimation: true
+          },
+          edgeSymbol: ['none', 'arrow'],
+          lineStyle: { color: '#cbd5e1', width: 1.2, curveness: 0.12 },
+          animationDurationUpdate: 300,
+          categories: [
+            { name: 'service', itemStyle: { color: color.service } },
+            { name: 'alert', itemStyle: { color: color.alert } },
+            { name: 'task', itemStyle: { color: color.task } },
+            { name: 'step', itemStyle: { color: color.step } }
+          ],
+          data: nodeList,
+          links: linkList
+        }]
+      })
+    }
+
+    const loadSteps = async (taskNode) => {
+      if (taskNode.expanded) {
+        // 折叠：移除该任务的步骤节点，恢复主干。
+        taskNode.expanded = false
+        nodes.forEach(n => {
+          if (n.id === taskNode.id) n.expanded = false
+        })
+        const visibleNodes = nodes.filter(n => !n.id.startsWith(`${taskNode.id}:step:`))
+        const visibleIds = new Set(visibleNodes.map(n => n.id))
+        const visibleLinks = (data.links || [])
+          .filter(l => visibleIds.has(l.source) && visibleIds.has(l.target))
+          .map(l => ({ source: l.source, target: l.target }))
+        renderOption(visibleNodes, visibleLinks)
+        return
+      }
+
+      // 未展开：先请求后端任务详情，拿完整 agentSteps，再截取关键步骤挂到图上。
+      taskNode.loading = true
+      try {
+        const res = await getTaskDetail(taskNode.taskId)
+        const task = res.data || {}
+        const rawSteps = task.agentSteps || task.steps || []
+        // 合并相同/连续同类步骤，只展示前 8 个关键步骤，避免星环。
+        const merged = []
+        rawSteps.forEach((s) => {
+          const text = String(s || '').replace(/^\(STEP\)\s*/, '').trim()
+          if (!text) return
+          const last = merged[merged.length - 1]
+          if (last && last.name === text) return
+          if (last && /^(诊断|执行|报告) Agent 调用/.test(last.name) && /^(诊断|执行|报告) Agent 调用/.test(text)) {
+            last.name = `${last.name} / ${text}`
+            return
+          }
+          merged.push({ name: text })
+        })
+        const maxSteps = 8
+        taskNode.steps = (merged.length > maxSteps ? merged.slice(0, maxSteps) : merged).map((s, i) => ({
+          id: `${taskNode.id}:step:${i}`,
+          name: s.name
+        }))
+        taskNode.expanded = true
+
+        const stepNodeList = taskNode.steps.map((s, i) => ({
+          id: s.id,
+          name: truncateLabel(s.name, 8),
+          fullName: s.name,
+          category: 'step',
+          symbolSize: 16,
+          itemStyle: { color: color.step },
+          value: s.name,
+          nodeType: 'step'
+        }))
+        const visibleNodes = [...nodes.filter(n => n.id !== taskNode.id), ...stepNodeList, taskNode]
+        // 每个步骤只连到任务节点，形成围绕式葡萄簇，而不是一条长链。
+        const stepLinks = taskNode.steps.map(s => ({ source: taskNode.id, target: s.id }))
+        const visibleIds = new Set(visibleNodes.map(n => n.id))
+        const baseLinks = (data.links || [])
+          .filter(l => visibleIds.has(l.source) && visibleIds.has(l.target))
+          .map(l => ({ source: l.source, target: l.target }))
+        renderOption(visibleNodes, [...baseLinks, ...stepLinks])
+      } catch (e) {
+        // 拿不到步骤时保持主干，不能把整个图搞坏
+      } finally {
+        taskNode.loading = false
+      }
+    }
+
+    renderOption(nodes, links)
+    graphChart.off('click')
+    graphChart.on('click', (params) => {
+      const node = params?.data
+      if (!node || node.nodeType !== 'task') return
+      loadSteps(node)
     })
   })
 }
@@ -159,13 +311,20 @@ const loadSimilar = async () => {
 onMounted(() => {
   loadGraph()
 })
+
+onUnmounted(() => {
+  if (graphChart) {
+    graphChart.dispose()
+    graphChart = null
+  }
+})
 </script>
 
 <style scoped>
 .toolbar { display: flex; gap: 8px; align-items: center; }
 .similar-form { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
-.graph-wrap { position: relative; border: 1px solid var(--c-border); border-radius: var(--radius-md); overflow: hidden; }
-.graph { height: 520px; }
+.graph-wrap { position: relative; border: 1px solid var(--c-border); border-radius: var(--radius-md); overflow: hidden; height: 600px; }
+.graph { height: 600px; }
 .graph-legend {
   position: absolute;
   right: 14px;

@@ -53,15 +53,17 @@ public class PodEventsTool extends KubernetesToolBase implements Tool {
         if (name == null) {
             return Tool.failure("Missing 'deployment' parameter（也接受 'service'）", start);
         }
+        // 跨 namespace 查询：告警明确带 namespace 时按它查，否则回退默认配置。
+        String ns = p.strOr(namespace, "namespace", "namespaceName");
 
         try {
             Deployment deployment = client.apps().deployments()
-                    .inNamespace(namespace).withName(name).get();
+                    .inNamespace(ns).withName(name).get();
             if (deployment == null) {
-                return Tool.failure("Deployment not found: " + name + " (namespace=" + namespace + ")", start);
+                return Tool.failure("Deployment not found: " + name + " (namespace=" + ns + ")", start);
             }
 
-            List<Pod> pods = client.pods().inNamespace(namespace)
+            List<Pod> pods = client.pods().inNamespace(ns)
                     .withLabelSelector(deployment.getSpec().getSelector())
                     .list().getItems();
 
@@ -91,7 +93,7 @@ public class PodEventsTool extends KubernetesToolBase implements Tool {
                 }
                 events.add(podSummary);
 
-                List<Event> podEvents = client.v1().events().inNamespace(namespace)
+                List<Event> podEvents = client.v1().events().inNamespace(ns)
                         .withField("involvedObject.name", podName)
                         .list().getItems();
                 for (Event e : podEvents) {
@@ -119,7 +121,7 @@ public class PodEventsTool extends KubernetesToolBase implements Tool {
 
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("deployment", name);
-            data.put("namespace", namespace);
+            data.put("namespace", ns);
             data.put("podCount", pods.size());
             data.put("eventCount", events.size());
             data.put("events", events);

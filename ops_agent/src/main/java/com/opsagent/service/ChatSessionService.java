@@ -84,6 +84,15 @@ public class ChatSessionService {
                 .onErrorReturn(false);
     }
 
+    public Mono<Boolean> delete(String username, String sessionId) {
+        if (username == null || username.isBlank() || sessionId == null || sessionId.isBlank()) {
+            return Mono.just(false);
+        }
+        return redisTemplate.opsForHash().remove(key(username), sessionId)
+                .map(removed -> removed > 0)
+                .onErrorReturn(false);
+    }
+
     private Mono<Void> touchInternal(String username, String sessionId, String title) {
         if (username == null || username.isBlank() || sessionId == null || sessionId.isBlank()) {
             return Mono.empty();

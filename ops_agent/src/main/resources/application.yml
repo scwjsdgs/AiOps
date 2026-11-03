@@ -31,7 +31,16 @@ spring:
       host: localhost
       port: 6379
       database: 0
-      timeout: 5000ms
+      # Redis 命令超时：告警风暴期间 MySQL/K8s 抖动会让 Redis 变慢，
+      # 之前 5s/10s 仍触发 command timed out；放宽到 15s 给慢命令余量。
+      timeout: 15s
+      lettuce:
+        pool:
+          max-active: 64
+          max-idle: 32
+          min-idle: 8
+          max-wait: 5s
+          time-between-eviction-runs: 30s
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
@@ -62,6 +71,8 @@ opsagent:
   kafka:
     tool-request-topic: ${KAFKA_TOOL_REQUEST_TOPIC:agent-tool-request}
     tool-result-topic: ${KAFKA_TOOL_RESULT_TOPIC:agent-tool-result}
+    # 文档系统变更事件：Java Webhook 接收后异步发 Kafka，Python 消费后增量更新 RAG。
+    doc-change-topic: ${KAFKA_DOC_CHANGE_TOPIC:doc-change}
   internal:
     # Python agent 回调 /api/agent/callback/** 时必须携带 X-Internal-Token，
     # 与 aiops-agent/.env 的 JAVA_INTERNAL_TOKEN 保持一致。
@@ -79,6 +90,17 @@ opsagent:
   approval:
     # auto：立即批准但落审计记录；manual：挂起等待外部审批（需要前端配合）
     mode: manual
+  # 生产级闭环状态机（告警-审批-验证）
+  # 业务规则：
+  #   1) 用户拒绝（或审批超时）后进入静默冷却期，期间同源告警只累加次数、不弹窗；
+  #      冷却结束时若仍在报错，自动重新拉起诊断与审批。
+  #   2) 每次修复批准后进入 VERIFYING 验证期（默认 5 分钟），验证失败最多自动重试
+  #      max-verification-rounds 轮；耗尽后告警 FAILED、发送最终失败报告、禁止再弹窗。
+  #   3) 验证通过 → 任务 SUCCESS + 告警 RESOLVED，彻底闭环。
+  lifecycle:
+    reject-cooldown-minutes: ${OPSAGENT_REJECT_COOLDOWN_MINUTES:15}
+    max-verification-rounds: ${OPSAGENT_MAX_VERIFICATION_ROUNDS:3}
+    cooldown-scan-interval-ms: 30000
   # 前瞻性增强一：指标基线学习 + 异常预警。
   # 周期采集各 Deployment 的 CPU/内存/重启次数，学习正常水位（均值±Nσ），
   # 偏离超阈值即生成「预测性预警」——此时 Prometheus 告警规则通常还没触发。
@@ -123,6 +145,9 @@ opsagent:
     # 告警降噪：同一 Pod/服务的多条告警（alertname 不同）在窗口内只触发一次
     # agent 分析，后续告警照常落库但聚合进已有分析任务。0 = 关闭。
     correlation-window-minutes: 3
+    # 文档系统 Webhook 专用 token：请求必须携带 X-Doc-Webhook-Token。
+    docs:
+      token: ${OPSAGENT_DOC_WEBHOOK_TOKEN:dev-doc-webhook-token}
   log:
     # SSH 取日志失败时的本地降级目录，留空表示不降级
     local-dir: ""

@@ -1,0 +1,1 @@
+Kafka 消费者在 RAG 更新时可能丢失，排查步骤：先检查消费组状态，再检查 topic partition 与 commit offset，最后确认消费异常是否触发重试。

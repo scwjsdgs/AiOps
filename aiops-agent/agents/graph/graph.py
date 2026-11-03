@@ -18,6 +18,7 @@ from typing import Any, AsyncGenerator, Optional
 
 from langchain_core.messages import HumanMessage, AIMessage
 from agents.graph.worker import sanitize_messages
+from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 
@@ -96,8 +97,10 @@ async def executor_graph_node(state: AgentState) -> dict:
 
     # Java 明确返回 pending=true（manual 模式）：interrupt 挂起等待人工决定。
     if approval_result is not None and (approval_result.data or {}).get("pending"):
-        request["requestId"] = (approval_result.data or {}).get("requestId", request.get("requestId", ""))
-        decision = interrupt({"type": "human_approval", "request": request, "requestId": request.get("requestId", "")})
+        java_request_id = (approval_result.data or {}).get("requestId") or request.get("requestId", "")
+        java_request_id = str(java_request_id).strip()
+        request["requestId"] = java_request_id
+        decision = interrupt({"type": "human_approval", "request": request, "requestId": java_request_id})
     else:
         # 审批服务不可用 / auto 未批准：fail-closed，不挂起也不执行写操作。
         return {
@@ -144,10 +147,15 @@ def _should_force_report(state: AgentState) -> bool:
     """iteration_count 防死循环条件边：达到上限后无论 Supervisor 想做什么都强制收束。
 
     报告 Agent 已完成后直接放行，避免把终态又拉回 loop。
+    Supervisor 每轮也会推进 supervisor_round，两个指标任一达到上限都强制收束，
+    防止诊断/执行子图里 iteration_count 增长慢、但主图轮次已经绕圈的情况。
     """
     if state.get("report"):
         return False
-    return (state.get("iteration_count") or 0) >= config.MAX_ITERATION_ROUNDS
+    iteration_rounds = (state.get("iteration_count") or 0)
+    supervisor_rounds = (state.get("supervisor_round") or 0)
+    limit = min(config.MAX_ITERATION_ROUNDS, config.AGENT_MAX_ITERATIONS)
+    return iteration_rounds >= limit or supervisor_rounds >= limit
 
 
 def route_after_diagnostic(state: AgentState) -> str:
@@ -264,11 +272,12 @@ def get_graph():
 
 
 def _build_initial_state(task_id: str, user_input: str, alert: Optional[Alert] = None,
-                         history: dict = None) -> dict:
+                         history: dict = None, chatops: bool = False) -> dict:
     """构造新任务状态；history 用于 ChatOps 多轮会话恢复已有 checkpoint。"""
     base = {
         "task_id": task_id,
         "core_intent": user_input[:200],
+        "chatops": chatops,
         "messages": [HumanMessage(content=user_input)],
         "evidence": [],
         "execution_results": [],
@@ -333,7 +342,9 @@ def _config_for(task_id: str) -> dict:
 
 async def run_graph_stream(task_id: str, user_input: str, max_iterations: int = None,
                            alert: Optional[Alert] = None,
-                           thread_id: str = None) -> AsyncGenerator[str, None]:
+                           thread_id: str = None,
+                           history_override: Optional[dict] = None,
+                           chatops: bool = False) -> AsyncGenerator[str, None]:
     """流式执行 LangGraph 状态图，产出与原 ReAct 相同的 SSE 事件。
 
     原 ReAct 的 while/iteration 由状态图的条件边 + retry_count 替代。
@@ -341,29 +352,86 @@ async def run_graph_stream(task_id: str, user_input: str, max_iterations: int = 
 
     thread_id 是 Checkpointer 的会话维度：ChatOps 传入 session_id，
     让同一会话的 langgraph 图状态跨页面/刷新持久化；告警任务仍用 task_id。
+
+    history_override 是 Java 网关从 Redis Memory 读出的最近 5 轮上下文；
+    优先级高于从 Checkpointer 恢复的旧状态，避免 Redis 30 分钟 TTL 与
+    LangGraph Checkpointer 双源不一致。
     """
     if max_iterations is None:
         max_iterations = config.AGENT_MAX_ITERATIONS
     thread_id = thread_id or task_id
 
-    history = await _load_graph_state(thread_id) or {}
-    initial = _build_initial_state(thread_id, user_input, alert, history=history)
+    history = history_override
+    if history is None:
+        history = await _load_graph_state(thread_id) or {}
+    # ChatOps 只读入口不恢复历史挂起的审批/执行状态，避免旧僵尸 checkpoint
+    # 让新提问继续卡在“等待人工审批”。只保留已完成会话中的消息/报告摘要。
+    if chatops and history and _state_is_chatops_stuck(history):
+        logger.warning("ChatOps checkpoint 存在审批/执行挂起，已丢弃旧状态 thread=%s", thread_id)
+        history = {}
+    # state.task_id 必须保持 Java 的真实任务 ID（chatops-xxx / 告警 taskId），
+    # thread_id 只用于 Checkpointer 的会话维度。此前 ChatOps 误把 sessionId
+    # 注入 state.task_id，导致 Python 工具回调以 sessionId 写 Java Redis task，
+    # 出现 “task:chat-xxx 不存在” 并被忽略。
+    initial = _build_initial_state(task_id, user_input, alert, history=history, chatops=chatops)
     graph = get_graph()
     graph_config = _config_for(thread_id)
 
-    # 一次性执行整个图：LangGraph 自己根据条件边/审批 interrupt 推进。
-    # 这里不再手写 while 循环。
-    result = await graph.ainvoke(initial, config=graph_config)
+    # 用 astream 而不是 ainvoke：主图推进过程中同步吐出 values/updates/custom，
+    # custom 通道承载报告 token，前端因此能获得打字机式增量，而不是等整轮 ainvoke
+    # 跑完后才收到一个 final。告警入口仍然只消费 final/awaiting_approval，行为不变。
+    result: dict = {}
+    pending_report_tokens: list[str] = []
+    async for event in graph.astream_events(initial, config=graph_config, version="v2"):
+        event_name = event.get("event") or ""
+        data = event.get("data") or {}
+
+        # 最终全局状态：name=LangGraph 且没有子图 namespace 时输出完整 AgentState。
+        if event_name == "on_chain_end" and str(event.get("name") or "") == "LangGraph":
+            namespace = event.get("metadata", {}).get("langgraph_node")
+            if namespace is None and isinstance(data.get("output"), dict):
+                result = data["output"]
+            continue
+
+        if event_name == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            token = str(getattr(chunk, "content", "") or "") if chunk is not None else ""
+            if token:
+                pending_report_tokens.append(token)
+                yield json.dumps({
+                    "type": "text",
+                    "content": token,
+                }, ensure_ascii=False)
+            continue
+
+        if event_name == "on_tool_start":
+            tool = str(event.get("name") or data.get("name") or "tool")
+            yield json.dumps({
+                "type": "tool_start",
+                "tool": tool,
+            }, ensure_ascii=False)
+            continue
+
+        if event_name == "on_tool_end":
+            tool = str(event.get("name") or data.get("name") or "tool")
+            output = data.get("output")
+            content = str(output)[:500] if output is not None else ""
+            yield json.dumps({
+                "type": "tool_end",
+                "tool": tool,
+                "content": content,
+            }, ensure_ascii=False)
+            continue
 
     # 图可能被 interrupt 挂起（result 包含 __interrupt__）。
     # 流式接口保持与旧版一致：有 report 则输出 final，否则输出挂起状态。
     interrupted = bool(result.get("__interrupt__"))
-    if result.get("report"):
-        report = result["report"]
+    report = result.get("report") or "".join(pending_report_tokens).strip()
+    if report:
         yield json.dumps({"type": "final", "data": report}, ensure_ascii=False)
         # 把轮次报告写回消息通道：ChatOps 刷新/切换会话时能恢复完整多轮历史。
         try:
-            sanitized = sanitize_messages(state.get("messages", []))
+            sanitized = sanitize_messages(result.get("messages", []))
             await graph.aupdate_state(
                 graph_config,
                 {"messages": sanitized + [AIMessage(content=str(report))]},
@@ -372,7 +440,13 @@ async def run_graph_stream(task_id: str, user_input: str, max_iterations: int = 
             logger.warning(f"报告写回 Checkpointer 失败 thread={thread_id}: {e}")
     elif interrupted or (result.get("approval_status") in ("pending", "none")
                          and result.get("next_agent") == "executor"):
-        request = result.get("approval_request") or result.get("__interrupt__")[0].value.get("request") or {}
+        # __interrupt__ 可能是 None（图未真正挂起但状态停留在审批前/后）；
+        # 直接取下标会抛 'NoneType' object is not subscriptable，把整个任务打 FAILED。
+        # 安全取值：只有 interrupt 列表非空才尝试取第一个的 request。
+        interrupts = result.get("__interrupt__") or []
+        request = result.get("approval_request") or (
+            interrupts[0].get("value", {}).get("request", {}) if interrupts else {}
+        ) or {}
         yield json.dumps({
             "type": "awaiting_approval",
             "data": {
@@ -390,17 +464,30 @@ async def run_graph_stream(task_id: str, user_input: str, max_iterations: int = 
 
 
 def _extract_pending_approval_request_id(snapshot) -> Optional[str]:
-    """从 LangGraph StateSnapshot 的 pending tasks 中提取审批 interrupt 的 requestId。
+    """从 LangGraph StateSnapshot 的当前挂起 interrupt 中提取审批 requestId。
 
-    未挂起时返回 None；多个 interrupt 时取第一个。
+    安全约束：只有当前仍挂起的 human_approval interrupt 才证明任务在等待审批。
+    approval_request.requestId 只是历史/审计字段，不能单独作为恢复凭证，
+    否则已完成的审批单可能被再次用来恢复任意高危任务。多个 interrupt 时取第一个。
     """
     try:
         for task in getattr(snapshot, "tasks", []) or []:
             for interrupt_obj in getattr(task, "interrupts", []) or []:
                 value = getattr(interrupt_obj, "value", None)
-                if isinstance(value, dict) and value.get("type") == "human_approval":
-                    request = value.get("request") or {}
-                    return str(value.get("requestId") or request.get("requestId") or "")
+                if not isinstance(value, dict):
+                    continue
+                if value.get("type") != "human_approval":
+                    continue
+                request = value.get("request") or {}
+                for candidate in (
+                        value.get("requestId"),
+                        request.get("requestId"),
+                        request.get("approvalId"),
+                        request.get("contextId"),
+                ):
+                    candidate = str(candidate or "").strip()
+                    if candidate:
+                        return candidate
     except Exception:
         pass
     return None
@@ -442,9 +529,16 @@ async def resume_graph(task_id: str, approval_decision: dict = None) -> dict:
     snapshot = await graph.aget_state(graph_config)
     pending_request_id = _extract_pending_approval_request_id(snapshot)
     if not pending_request_id:
-        raise ValueError("task 未处于人工审批挂起状态，不允许 resume")
-    request_id = decision.get("requestId", "")
-    if not request_id or request_id != pending_request_id:
+        raise ValueError("task 未处于人工审批挂起状态，不允许 resume（taskId 与 Checkpoint 线程 ID 可能不一致）")
+    request_id = str(decision.get("requestId") or "").strip()
+    if not request_id:
+        raise ValueError("resume 缺少 requestId")
+    if request_id != (pending_request_id or "").strip():
+        # 宽松匹配之前必须留日志，便于排查 Java 回调与 Checkpoint 的 requestId 来源。
+        logger.warning(
+            "审批恢复 requestId 不一致 task=%s incoming=%s checkpoint=%s",
+            task_id, request_id, pending_request_id,
+        )
         raise ValueError("requestId 与当前挂起审批单不匹配")
 
     resume_payload = {
@@ -456,6 +550,20 @@ async def resume_graph(task_id: str, approval_decision: dict = None) -> dict:
         Command(resume=resume_payload),
         config=graph_config,
     )
+    # 恢复成功后清理当前挂起凭证，并单独保留最近完成 ID 供审计。
+    # approval_request.requestId 不能继续留成“当前挂起单”，否则历史值可能被
+    # 误当作有效审批凭证再次通过校验。
+    try:
+        await graph.aupdate_state(graph_config, {
+            "approval_request": {
+                **(result.get("approval_request") or {}),
+                "requestId": None,
+                "note": decision.get("note", ""),
+            },
+            "last_completed_request_id": request_id,
+        })
+    except Exception as e:
+        logger.warning(f"恢复后清理 approval_request.requestId 失败 task={task_id}: {e}")
     # 恢复完成后走与 run_agent_for_alert 相同的收尾：Reflection + 回传 Java。
     report = result.get("report")
     if report:
@@ -469,9 +577,17 @@ async def resume_graph(task_id: str, approval_decision: dict = None) -> dict:
             from agents.react_agent import _revise_report_with_feedback
             final_report = await _revise_report_with_feedback(report, review["feedback"], evidence)
         alert_meta = state.get("alert") or {}
+        final_status = "SUCCESS"
+        if not approved:
+            # 人工拒绝审批：任务语义是“已拒绝”，不是系统失败，也不是成功。
+            final_status = "REJECTED"
+            final_report = (final_report or "") + (
+                "\n\n---\n任务已终止：用户拒绝了高危修复操作，未对集群做任何变更。"
+            )
         await callback_service.complete_task(
             task_id,
             final_report,
+            status=final_status,
             service_name=alert_meta.get("service_name", ""),
             alert_name=alert_meta.get("alert_name", ""),
         )
@@ -500,9 +616,11 @@ async def run_agent_for_alert(task_id: str, alert: Alert) -> str:
 
     final = None
     pending = False
+    # 只读告警（预测性预警等）：不触发 executor/审批，只输出诊断报告。
+    readonly = bool(getattr(alert, "readonly", False))
     try:
         async with asyncio.timeout(config.AGENT_TIMEOUT_SECONDS):
-            async for event in run_graph_stream(task_id, user_input, alert=alert):
+            async for event in run_graph_stream(task_id, user_input, alert=alert, chatops=readonly):
                 data = json.loads(event)
                 if data.get("type") == "final":
                     final = data.get("data")
@@ -569,9 +687,27 @@ async def _load_graph_state(task_id: str) -> Optional[dict]:
         return None
 
 
+def _state_is_chatops_stuck(state: dict) -> bool:
+    """判断 ChatOps 旧 checkpoint 是否仍挂起人工审批、需要丢弃重来。"""
+    if not state:
+        return False
+    if state.get("report"):
+        return False
+    # 只有明确停留在审批中断，才可能让下一次提问继续卡住。
+    if state.get("approval_status") == "pending":
+        return True
+    # 旧版 ChatOps 曾进入 executor 且还没完成报告，同样按挂起处理。
+    committed_executor = "executor" in (state.get("completed_agents") or [])
+    if committed_executor and state.get("approval_status") in ("pending", "none"):
+        return True
+    return False
+
+
 # 兼容旧入口，避免其它调用方因 import 报错
 async def run_react_loop(task_id: str, user_input: str, max_iterations: int = None,
-                         thread_id: str = None):
+                         thread_id: str = None, history_override: dict = None):
     async for event in run_graph_stream(task_id, user_input, max_iterations,
-                                        thread_id=thread_id):
+                                        thread_id=thread_id,
+                                        history_override=history_override,
+                                        chatops=True):
         yield event

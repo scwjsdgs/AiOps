@@ -2,7 +2,9 @@ package com.opsagent.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.opsagent.entity.AlertEntity;
 import com.opsagent.model.Alert;
+import com.opsagent.repository.AlertRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
@@ -18,11 +20,14 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -53,6 +58,7 @@ public class MetricBaselineService {
 
     private static final String BASELINE_PREFIX = "baseline:";
     private static final String COOLDOWN_PREFIX = "anomaly:cooldown:";
+    private static final String RESTART_STATE_PREFIX = "anomaly:restart-state:";
 
     /** 被基线的指标。cpu/memory 是瞬时水位，restarts 是累计计数器（看增量）。 */
     public static final String METRIC_CPU = "cpu";
@@ -62,6 +68,7 @@ public class MetricBaselineService {
     private final MetricService metricService;
     private final StringRedisTemplate redisTemplate;
     private final AlertIngestionService alertIngestionService;
+    private final AlertRepository alertRepository;
     private final MeterRegistry meterRegistry;
 
     /**
@@ -71,10 +78,12 @@ public class MetricBaselineService {
     public MetricBaselineService(MetricService metricService,
                                  StringRedisTemplate redisTemplate,
                                  @Lazy AlertIngestionService alertIngestionService,
+                                 AlertRepository alertRepository,
                                  MeterRegistry meterRegistry) {
         this.metricService = metricService;
         this.redisTemplate = redisTemplate;
         this.alertIngestionService = alertIngestionService;
+        this.alertRepository = alertRepository;
         this.meterRegistry = meterRegistry;
     }
 
@@ -138,6 +147,13 @@ public class MetricBaselineService {
     /** 上一次的累计重启数：key = deployment，用来算增量。 */
     private final Map<String, Long> lastRestartTotals = new ConcurrentHashMap<>();
 
+    /**
+     * 本地告警冷却缓存：key = deployment|metric -> 下次可告警的 epoch 毫秒。
+     * 告警风暴期间先用本地缓存挡住，避免每个采样周期都去 Redis setIfAbsent，
+     * 同时保留 Redis TTL 作为多实例兜底。
+     */
+    private final Map<String, Long> localCooldown = new ConcurrentHashMap<>();
+
     private Disposable collector;
 
     @PostConstruct
@@ -150,6 +166,13 @@ public class MetricBaselineService {
         if (!enabled) {
             log.info("指标基线预警已关闭（opsagent.anomaly.enabled=false）");
             return;
+        }
+        // 启动时清理僵尸预测性预警：PENDING/FIRING 且超过 5 分钟的预测预警
+        // 可能是 Java 崩溃/重启留下的卡死状态，留着会持续压制新预警。
+        try {
+            cleanupStalePredictiveAlerts();
+        } catch (Exception e) {
+            log.warn("启动清理预测性预警失败（不影响采集）: {}", e.getMessage());
         }
         // 与 WebSocket 心跳、回归验证保持同一套 Reactor 风格，不引入 @Scheduled
         long interval = Math.max(10, intervalSeconds);
@@ -169,6 +192,36 @@ public class MetricBaselineService {
         if (collector != null && !collector.isDisposed()) {
             collector.dispose();
         }
+    }
+
+    /**
+     * 清理超过 5 分钟仍停在 PENDING/FIRING 的预测性预警。
+     *
+     * 这些通常来自 Java 进程崩溃/重启导致的卡死状态；不清理会让同服务
+     * 的新预测预警一直被旧告警压制。
+     */
+    private void cleanupStalePredictiveAlerts() {
+        LocalDateTime deadline = LocalDateTime.now().minusMinutes(5);
+        List<AlertEntity> stale = alertRepository.findBySourceAndStatusInAndCreateTimeBefore(
+                "anomaly-detector",
+                List.of("PENDING", "FIRING"),
+                deadline);
+        if (stale.isEmpty()) {
+            log.info("启动清理：无超过 5 分钟的僵尸预测性预警");
+            return;
+        }
+        int cleared = 0;
+        for (AlertEntity alert : stale) {
+            try {
+                alert.setStatus("RESOLVED");
+                alert.setProcessed(true);
+                alertRepository.save(alert);
+                cleared++;
+            } catch (Exception e) {
+                log.warn("清理预测性预警失败 id={}: {}", alert.getId(), e.getMessage());
+            }
+        }
+        log.warn("启动清理：{} 条超过 5 分钟的预测性预警已置为 RESOLVED", cleared);
     }
 
     /**
@@ -270,15 +323,52 @@ public class MetricBaselineService {
             return;
         }
         long current = total.longValue();
-        Long previous = lastRestartTotals.put(deployment, current);
+
+        // 重启基准持久化到 Redis：Java 重启后优先读上次采样值，而不是直接 return。
+        // 这样“杀进程再重启”场景仍能算出差量，不会因为内存丢失而静默。
+        Long previous = lastRestartTotals.get(deployment);
         if (previous == null) {
-            return; // 首次见到，只记录基准
+            String saved = null;
+            try {
+                saved = redisTemplate.opsForValue().get(RESTART_STATE_PREFIX + deployment);
+            } catch (Exception e) {
+                log.warn("读取重启基准 Redis 失败（按无基准处理） deployment={}: {}", deployment, e.getMessage());
+            }
+            if (saved != null && !saved.isBlank()) {
+                try {
+                    previous = Long.parseLong(saved);
+                } catch (NumberFormatException ignore) {
+                    previous = null;
+                }
+            }
         }
-        if (current < previous) {
-            // 总数变小 = Pod 被替换过（新 Pod 计数器从 0 开始），重置基准不误报
+        lastRestartTotals.put(deployment, current);
+        // 无论是否有前一基准，都把最新 current 持久化，供下次进程启动恢复。
+        try {
+            redisTemplate.opsForValue().set(RESTART_STATE_PREFIX + deployment, String.valueOf(current),
+                    Duration.ofHours(24));
+        } catch (Exception e) {
+            log.warn("写入重启基准 Redis 失败 deployment={}: {}", deployment, e.getMessage());
+        }
+
+        if (previous == null) {
+            // 真·首次看到该 Deployment（Redis 也没有）：只记录基准，本轮不误报
             return;
         }
         long delta = current - previous;
+        if (current < previous) {
+            // 总数变小 = Pod 被替换过（新 Pod 计数器从 0 开始），不按异常告警
+            return;
+        }
+        // restart 也维护采样窗口：把每个周期的增量写入 Redis，避免 Java 重启后就失忆。
+        // 窗口用增量序列判 Z-score：正常周期增量 0/1，崩溃循环会突然 3+。
+        List<Double> window = readWindow(deployment, METRIC_RESTARTS);
+        window.add((double) delta);
+        while (window.size() > Math.max(minSamples, windowSamples)) {
+            window.remove(0);
+        }
+        writeWindow(deployment, METRIC_RESTARTS, window);
+
         if (delta < Math.max(1, restartDeltaThreshold)) {
             return;
         }
@@ -302,12 +392,71 @@ public class MetricBaselineService {
      */
     private void raiseAlert(String deployment, String metric, String title, String description,
                             Map<String, String> extra) {
-        String cooldownKey = COOLDOWN_PREFIX + deployment + ":" + metric;
-        Boolean fresh = redisTemplate.opsForValue()
-                .setIfAbsent(cooldownKey, "1", Duration.ofMinutes(Math.max(1, cooldownMinutes)));
-        if (Boolean.FALSE.equals(fresh)) {
+        String cacheKey = deployment + "|" + metric;
+        long cooldownMs = Duration.ofMinutes(Math.max(1, cooldownMinutes)).toMillis();
+        long now = System.currentTimeMillis();
+        Long localUntil = localCooldown.get(cacheKey);
+        if (localUntil != null && now < localUntil) {
             anomalySuppressed.increment();
-            log.debug("预警处于冷却期，抑制：{}/{}", deployment, metric);
+            log.debug("预警处于本地冷却期，抑制：{}/{}", deployment, metric);
+            return;
+        }
+
+        // Redis 冷却作为持久/多实例兜底；即使 Redis 超时，也要保证主链路不中断。
+        boolean redisFresh = true;
+        try {
+            String cooldownKey = COOLDOWN_PREFIX + deployment + ":" + metric;
+            Boolean fresh = redisTemplate.opsForValue()
+                    .setIfAbsent(cooldownKey, "1", Duration.ofMinutes(Math.max(1, cooldownMinutes)));
+            redisFresh = !Boolean.FALSE.equals(fresh);
+        } catch (Exception e) {
+            log.warn("Redis 冷却写入超时降级 deployment={} metric={}: {}", deployment, metric, e.getMessage());
+        }
+        if (!redisFresh) {
+            anomalySuppressed.increment();
+            log.debug("预警处于 Redis 冷却期，抑制：{}/{}", deployment, metric);
+            return;
+        }
+        // Redis 成功后才写本地缓存，避免 Redis 超时时本地仍误伤后续告警。
+        localCooldown.put(cacheKey, now + cooldownMs);
+        try {
+            // 清理过期本地项，防止长期运行内存膨胀
+            localCooldown.entrySet().removeIf(en -> en.getValue() < now - cooldownMs);
+        } catch (Exception ignore) {
+            // 清理失败不影响告警主链路
+        }
+
+        // 真实告警优先：只要该服务已有活跃的真实告警（CrashLoop/OOMKilled/ImagePull），
+        // 绝对禁止生成预测预警——真实的灾难已发生，不需要预测。
+        try {
+            java.util.List<AlertEntity> existing = alertRepository
+                    .findFirstByServiceNameAndStatusInOrderByCreateTimeDesc(
+                            deployment, java.util.List.of("PENDING", "FIRING", "ANALYZING", "REGRESSED", "CORRELATED", "VERIFYING"));
+            boolean hasRealActive = existing.stream().anyMatch(a ->
+                    !"anomaly-detector".equalsIgnoreCase(a.getSource())
+                            && ((containsAny(a.getTitle(), "crashloop", "oomkilled", "imagepull", "oom")
+                            || containsAny(a.getDescription(), "crashloop", "oomkilled", "imagepull", "oom")
+                            || containsAny(a.getDetail(), "crashloop", "oomkilled", "imagepull", "oom"))));
+            if (hasRealActive) {
+                anomalySuppressed.increment();
+                log.warn("服务 {} 已有活跃真实告警（CrashLoop/OOM/ImagePull），抑制预测预警：{}/{}",
+                        deployment, deployment, metric);
+                return;
+            }
+        } catch (Exception e) {
+            log.debug("查询真实告警失败（继续发预警）: {}", e.getMessage());
+        }
+
+        // 静音低基数误报源：grafana / local-path-provisioner 这类“内存低于基线均值”的
+        // 波动大多是低基数效应，无关痛痒，直接抑制，不弹前端。
+        String lowerDep = deployment.toLowerCase();
+        boolean lowBaseSilenced = lowerDep.equals("grafana")
+                || lowerDep.equals("local-path-provisioner")
+                || lowerDep.equals("kube-state-metrics")
+                || lowerDep.equals("kube-prometheus-stack-grafana");
+        if (lowBaseSilenced && (description != null && description.contains("低于基线均值"))) {
+            anomalySuppressed.increment();
+            log.info("低基数误报源已静音：{} 的“低于基线均值”波动不生成预测预警", deployment);
             return;
         }
 
@@ -325,11 +474,26 @@ public class MetricBaselineService {
         alert.setDetail("指标=" + metric + " " + extra);
         alert.setTimestamp(java.time.LocalDateTime.now());
         alert.setStatus("FIRING");
+        // 预测预警只做只读诊断，不触发高危 executor/审批
+        alert.setReadonly(true);
 
-        // 与普通告警走完全相同的下游链路：落库 → 建任务 → 通知 agent 分析
+        // 与普通告警走相同的落库/建任务链路，但下游按 readonly 只读分析
         alertIngestionService.processAlert(alert)
                 .subscribe(v -> { },
                         e -> log.warn("投递预测性预警失败 deployment={}: {}", deployment, e.getMessage()));
+    }
+
+    private static boolean containsAny(String text, String... keys) {
+        if (text == null) {
+            return false;
+        }
+        String lower = text.toLowerCase();
+        for (String k : keys) {
+            if (lower.contains(k)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---------------- 基线窗口读写 ----------------
@@ -563,28 +727,60 @@ public class MetricBaselineService {
         result.put("sigma", sigma);
 
         List<Map<String, Object>> rows = new ArrayList<>();
+        boolean prometheusOk = false;
         try {
-            Map<String, Double> cpu = aggregateByDeployment(
-                    metricService.query("sum(rate(container_cpu_usage_seconds_total"
-                            + "{container!=\"POD\",image!=\"\"}[3m])) by (pod)"));
+            List<Map<String, Object>> cpuRows = metricService.query("sum(rate(container_cpu_usage_seconds_total"
+                    + "{container!=\"POD\",image!=\"\"}[3m])) by (pod)");
+            // 只读快照：Prometheus 查询成功（即使没有 result）也算连接正常，
+            // 不能因为“当前没有 Pod 数据”就把整个基线能力标成不可用。
+            prometheusOk = cpuRows != null;
+            Map<String, Double> cpu = aggregateByDeployment(cpuRows);
             Map<String, Double> memory = aggregateByDeployment(
                     metricService.query("sum(container_memory_working_set_bytes"
                             + "{container!=\"POD\",image!=\"\"}) by (pod)"));
 
-            for (String deployment : new java.util.TreeSet<>(union(cpu.keySet(), memory.keySet()))) {
+            // Deployment 兜底：聚合依赖 kube_deployment_spec_replicas 做 Pod 前缀匹配，
+            // 该查询万一为空，就从可用指标里再收敛一次 deployment 名，确保列表不空。
+            Set<String> deployments = new TreeSet<>(union(cpu.keySet(), memory.keySet()));
+            List<Map<String, Object>> deploymentRows =
+                    metricService.query("kube_deployment_spec_replicas");
+            if (deploymentRows != null) {
+                prometheusOk = true;
+                for (Map<String, Object> row : deploymentRows) {
+                    Object metricObj = row.get("metric");
+                    if (metricObj instanceof Map<?, ?> metric) {
+                        String dep = String.valueOf(metric.get("deployment"));
+                        if (dep != null && !"null".equals(dep) && !dep.isBlank()) {
+                            deployments.add(dep);
+                        }
+                    }
+                }
+            }
+
+            for (String deployment : deployments) {
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("deployment", deployment);
                 item.put("cpu", describe(deployment, METRIC_CPU, cpu.get(deployment)));
                 item.put("memory", describe(deployment, METRIC_MEMORY, memory.get(deployment)));
                 rows.add(item);
             }
-            result.put("connected", !rows.isEmpty() || !cpu.isEmpty());
+            result.put("connected", prometheusOk);
+            result.put("cadvisorConnected",
+                    isCadvisorHealthy());
         } catch (Exception e) {
             log.warn("基线快照查询失败: {}", e.getMessage());
             result.put("connected", false);
         }
         result.put("deployments", rows);
         return result;
+    }
+
+    private boolean isCadvisorHealthy() {
+        try {
+            return MetricService.isUp(metricService.query("up{job=\"cAdvisor\"}"));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** 单个指标的当前值 + 基线区间 + 偏离度。样本不足时 baseline 为 null。 */

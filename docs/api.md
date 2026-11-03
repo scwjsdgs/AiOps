@@ -207,11 +207,25 @@ curl -s -X POST localhost:8081/api/tools/execute -H "Authorization: Bearer $TOKE
 | `/api/rag/knowledge/rebuild` | POST | 重建向量库 |
 | `/api/rag/knowledge/delete` | POST | 删除文档（`source`） |
 | `/api/rag/knowledge/retry` | POST | 重试失败上传任务 |
+| `/api/rag/docs/webhook` | POST | 文档系统变更 Webhook（`X-Doc-Webhook-Token`，body 含 docId/filename/content/status/version），Java 异步发 Kafka `doc-change`，Python 增量更新 Chroma |
 | `/api/rag/evaluate` | POST | RAG 分层评测 |
 | `/api/rag/debug` | POST | RAG 检索阶段调试 |
 | `/api/llm/cost` | GET | LLM Token / 成本 / 缓存 / 预算统计 |
 | `/api/chaos/run` | GET | 混沌评测（RAG 降级场景） |
 | `/api/chaos/adversarial` | GET | 提示注入 / 伪造报告对抗测试 |
+
+### 文档事件驱动 RAG 更新
+
+文档系统发送 `POST /api/rag/docs/webhook`，Java 返回 202 后异步投递 Kafka `doc-change`；Python 消费者 `services/doc_change_consumer.py` 收到后：
+
+- `status=published/updated/upsert`：调用 `knowledge_manager.upload_document` 切分、embedding、增量 upsert；
+- `status=archived/deleted`：调用 `soft_delete_document`，把 Chroma chunk metadata 标记为 `status=DISABLED`；
+- 向量检索数据库层使用 `where={"status": {"$ne": "DISABLED"}}`，BM25 构建索引时排除 DISABLED；
+- 重新发布同一 `filename` 时恢复 `ACTIVE` 并重新参与检索。
+
+### ChatOps Redis Memory
+
+Java 网关在每次 `/api/chatops/stream` 请求前读取 `chatops:memory:{userId}:{sessionId}`（Redis List，最近 5 轮 user/assistant），随请求转发 Python；SSE 正常结束异步写回本轮消息并续期 TTL 30 分钟。前端主动断开时 Java 调 `/api/agent/cancel/{taskId}` 级联取消 Python 推理。
 
 ## WebSocket
 
@@ -221,9 +235,9 @@ curl -s -X POST localhost:8081/api/tools/execute -H "Authorization: Bearer $TOKE
 
 ## 鉴权与安全防线
 
-1. **JWT 登录认证**：前端所有管理接口走 Bearer JWT。`JwtAuthenticationFilter` 放行 `/api/auth/login`、`/actuator/health`、`/ws/agent`（校验 query string token）、`/api/alerts/webhook`（自身校验）。
+1. **JWT 登录认证**：前端所有管理接口走 Bearer JWT。`JwtAuthenticationFilter` 放行 `/api/auth/login`、`/actuator/health`、`/ws/agent`（校验 query string token）、`/api/alerts/webhook`（自身校验）、`/api/rag/docs/webhook`（自身校验）。
 2. **内部通信**：AI 大脑回调 `/api/agent/callback/**` 必须携带 `X-Internal-Token`。
-3. **Webhook 自身认证**：Alertmanager Webhook 不走 JWT，走 `X-Webhook-Token`，可在 `application.yml` 关闭（仅开发调试）。可选 HMAC 签名校验。
+3. **Webhook 自身认证**：Alertmanager Webhook 不走 JWT，走 `X-Webhook-Token`；文档系统 Webhook 走 `X-Doc-Webhook-Token`，均可在 `application.yml` 关闭（仅开发调试）。可选 HMAC 签名校验（告警 Webhook）。
 4. **工具白名单**：LLM 仅能调用 `opsagent.tools.agent-exposed` 列表，`generic_command` 不暴露给 AI，但可在 `/api/tools/execute` 手工使用。
 5. **防重复执行**：LangGraph 图非幂等，Python 侧 Checkpointer 按 taskId 互锁（本地 SqliteSaver / 生产 Redis，接口一致）+ Java 侧 409 去重双层互锁。重启、扩容等操作不做自动重试。
 

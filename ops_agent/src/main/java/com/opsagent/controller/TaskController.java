@@ -60,4 +60,26 @@ public class TaskController {
                     return ApiResponse.success(data);
                 });
     }
+
+    /**
+     * 清理残留任务（运维用）。默认只清 24 小时前的 PENDING 僵尸任务，避免误删活跃任务。
+     *
+     * ?status=FAILED&olderThanMinutes=60  清理 1 小时前的失败任务
+     * ?status=PENDING&olderThanMinutes=5  清理 5 分钟前的排队僵尸
+     * 不带参数时清理 24 小时前的所有状态任务。
+     */
+    @DeleteMapping("/purge")
+    public Mono<ApiResponse<Map<String, Object>>> purgeTasks(
+            @RequestParam(required = false) String status,
+            @RequestParam(defaultValue = "0") int olderThanMinutes) {
+        int older = olderThanMinutes <= 0 ? 24 * 60 : olderThanMinutes;
+        return taskScheduler.purgeTasks(status, older)
+                .map(cleaned -> {
+                    Map<String, Object> data = new LinkedHashMap<>();
+                    data.put("cleaned", cleaned);
+                    data.put("status", status == null || status.isBlank() ? "ALL" : status);
+                    data.put("olderThanMinutes", older);
+                    return ApiResponse.success(data);
+                });
+    }
 }

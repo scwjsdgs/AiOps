@@ -34,10 +34,13 @@ data:
               - "kube-state-metrics.monitoring:8080"
 
       - job_name: node-exporter
-        static_configs:
-          - targets:
-              - "172.18.0.3:9100"
+        kubernetes_sd_configs:
+          - role: node
         relabel_configs:
+          - source_labels: [__meta_kubernetes_node_address_InternalIP]
+            action: replace
+            target_label: __address__
+            replacement: "${1}:9100"
           - action: replace
             replacement: node-exporter
             target_label: job
@@ -48,9 +51,13 @@ data:
         bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
         tls_config:
           insecure_skip_verify: true
-        static_configs:
-          - targets:
-              - "172.18.0.3:10250"
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_address_InternalIP]
+            action: replace
+            target_label: __address__
+            replacement: "${1}:10250"
         honor_labels: true
   rules.yml: |
     groups:
@@ -58,9 +65,18 @@ data:
         interval: 15s
         rules:
           - alert: DemoAppCrashLoop
+            # 根因修复(2026-10-23): 原表达式 increase(restarts_total[5m]) > 1 + for: 2m
+            # 在 CrashLoopBackOff 指数退避下会抖动——退避到 5 分钟级时,5 分钟窗口内
+            # 增量常掉到 0~1,规则在 inactive/pending 之间横跳,for 永远攒不满 2 分钟,
+            # 告警停在 pending 永不 firing,Alertmanager/Java 后端永远收不到。
+            # 改回官方 KubePodCrashLooping 同款: 用 waiting_reason=CrashLoopBackOff
+            # 持续状态指标(故障期间恒为 1,天然连续),for: 1m 即可稳定触发。
             expr: |
-              increase(kube_pod_container_status_restarts_total{namespace="default", pod=~"leaky-app-.*"}[5m]) > 1
-            for: 2m
+              kube_pod_container_status_waiting_reason{namespace="default", reason="CrashLoopBackOff", pod=~"leaky-app-.*"} == 1
+            for: 1m
+            # keep_firing_for: 条件短暂不满足（CrashLoop 周期内 waiting_reason 会瞬时归零）
+            # 仍保持 firing，避免告警在 resolved/firing 之间频繁闪烁，触发告警风暴。
+            keep_firing_for: 2m
             labels:
               severity: critical
               service: leaky-app
@@ -68,6 +84,46 @@ data:
             annotations:
               summary: leaky-app 频繁重启(CrashLoopBackOff)
               description: leaky-app Pod 在 5 分钟内重启多次，可能存在代码级内存泄漏或启动崩溃，需排查.
+          - alert: FaultOOMKilled
+            expr: |
+              kube_pod_container_status_last_terminated_reason{reason="OOMKilled", namespace="default"} == 1
+            for: 30s
+            labels:
+              severity: critical
+              namespace: default
+            annotations:
+              summary: "Pod OOMKilled"
+              description: "Pod {{ $labels.pod }} 因内存超限被 OOM Killer 终止（OOMKilled）。"
+          - alert: FaultImagePullBackOff
+            expr: |
+              kube_pod_container_status_waiting_reason{reason="ImagePullBackOff", namespace="default"} == 1
+            for: 30s
+            labels:
+              severity: critical
+              namespace: default
+            annotations:
+              summary: "Pod ImagePullBackOff"
+              description: "Pod {{ $labels.pod }} 镜像拉取失败（ImagePullBackOff）。"
+          - alert: FaultPodPending
+            expr: |
+              kube_pod_status_phase{phase="Pending", namespace="default"} == 1
+            for: 30s
+            labels:
+              severity: warning
+              namespace: default
+            annotations:
+              summary: "Pod Pending"
+              description: "Pod {{ $labels.pod }} 长时间无法调度（Pending）。"
+          - alert: FaultReadinessProbeFailed
+            expr: |
+              kube_pod_container_status_ready{pod=~"fault-probe-.*", namespace="default"} == 0
+            for: 60s
+            labels:
+              severity: warning
+              namespace: default
+            annotations:
+              summary: "Pod readiness 探针失败"
+              description: "Pod {{ $labels.pod }} 处于 Running 但容器 readiness 探针失败（未就绪）。"
 ---
 apiVersion: apps/v1
 kind: Deployment
