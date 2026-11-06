@@ -114,3 +114,6 @@ Desktop.ini
 chroma_db/
 memory_storage/
 aiops-agent/memory_storage/
+
+# paircode — adversarial multi-LLM peer review state
+.paircode/
