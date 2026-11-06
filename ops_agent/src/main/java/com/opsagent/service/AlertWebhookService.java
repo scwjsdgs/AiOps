@@ -42,6 +42,7 @@ public class AlertWebhookService {
     private final MeterRegistry meterRegistry;
     private final RecoveryVerificationService recoveryVerificationService;
     private final AlertLifecycleService alertLifecycleService;
+    private final CorrelationService correlationService;
 
     @Value("${opsagent.webhook.idempotency.ttlMinutes:5}")
     private long idempotencyTtlMinutes;
@@ -70,14 +71,6 @@ public class AlertWebhookService {
 
     @Value("")
     private String escalationTitlePrefix;
-
-    /**
-     * 窗口内暂存 corrKey -> alertId：首条告警占住聚合键时任务还没建出来
-     * （值先写 "PENDING"），任务建好后在这里回填真实 taskId。
-     * 用 ConcurrentHashMap：handleSingleAlert 在 boundedElastic 上跑，可能并发。
-     */
-    private final java.util.concurrent.ConcurrentHashMap<String, String> pendingCorrKeys =
-            new java.util.concurrent.ConcurrentHashMap<>();
 
     @PostConstruct
     public void initMetrics() {
@@ -302,7 +295,7 @@ public class AlertWebhookService {
         Boolean canMerge = null; // null=未判定，true=可合并，false=必须放行
         String corrKey = null;
         if (correlationWindowMinutes > 0) {
-            corrKey = buildCorrelationKey(amAlert.getLabels());
+            corrKey = correlationService.buildCorrelationKey(amAlert.getLabels());
         }
         boolean tryCorrelate = !forceRetrigger && corrKey != null && !corrKey.isBlank();
 
@@ -310,7 +303,7 @@ public class AlertWebhookService {
         String existingTaskId = null;
         if (tryCorrelate) {
             try {
-                existingTaskId = redisTemplate.opsForValue().get("webhook:corr:" + corrKey);
+                existingTaskId = correlationService.readCorrKey(corrKey);
             } catch (Exception e) {
                 // Redis 超时/不可用：拿不到聚合键就按无聚合处理，绝不阻塞主流程。
                 // existingTaskId 保持 null 走 DB 兜底，宁建新任务也不吞告警。
@@ -318,14 +311,14 @@ public class AlertWebhookService {
             }
         }
         if (tryCorrelate && existingTaskId != null && !existingTaskId.isBlank()) {
-            canMerge = taskCanMerge(existingTaskId);
+            canMerge = correlationService.taskCanMerge(existingTaskId);
             if (Boolean.FALSE.equals(canMerge)) {
                 log.warn("降噪检查：任务 {} 已非活动（REJECTED/FAILED/TIMEOUT），放行新告警并重新建任务 title={}",
                         existingTaskId, alert.getTitle());
                 // 清掉已经失效的聚合键，避免后续告警继续被旧任务拦住
                 if (corrKey != null) {
                     try {
-                        redisTemplate.delete("webhook:corr:" + corrKey);
+                        correlationService.deleteCorrKey(corrKey);
                     } catch (Exception e) {
                         log.warn("清理失效聚合键失败 corrKey={}: {}", corrKey, e.getMessage());
                     }
@@ -344,7 +337,7 @@ public class AlertWebhookService {
                         String recentTaskId = taskScheduler.findLatestTaskByAlertId(recentAlert.getId())
                                 .map(t -> t.getId()).block();
                         if (recentTaskId != null) {
-                            canMerge = taskCanMerge(recentTaskId);
+                            canMerge = correlationService.taskCanMerge(recentTaskId);
                             // 关键修复：DB 兜底分支找到了关联任务，必须同步回填 existingTaskId。
                             // 否则下方聚合分支的 resolvedTaskId 永远为空，即使 canMerge=true 也会
                             // 走进「兜底 Lock」分支——只打日志不建任务、把新告警落成 CORRELATED 后
@@ -391,7 +384,7 @@ public class AlertWebhookService {
 
                 // 聚合落库：不盲目 insert 新行。优先找同服务活跃（PENDING/FIRING/CORRELATED）
                 // 的旧告警，命中则更新 occurrenceCount + 时间戳/内容；没有才新建。
-                persistCorrelatedAlert(alert, resolvedTaskId, fingerprint);
+                correlationService.persistCorrelatedAlert(alert, resolvedTaskId, fingerprint);
                 return;
             }
         } else {
@@ -412,9 +405,7 @@ public class AlertWebhookService {
             // 占聚合键是增强降噪的可选项，绝不能因 Redis 超时让它中断主流程
             // （否则下面复用老记录/建任务全被跳过，告警静默丢失）。
             try {
-                redisTemplate.opsForValue().set("webhook:corr:" + corrKey, "PENDING",
-                        java.time.Duration.ofMinutes(correlationWindowMinutes));
-                pendingCorrKeys.put(corrKey, firstAlertId);
+                correlationService.occupyCorrKey(corrKey, firstAlertId);
             } catch (Exception e) {
                 log.warn("占位聚合键失败（降噪退化为无关联，安全） corrKey={}: {}", corrKey, e.getMessage());
             }
@@ -452,7 +443,7 @@ public class AlertWebhookService {
         // 脱离观察期的 SUCCESS、TIMEOUT 同样视为「旧任务已定型」——新 firing 是新的
         // 故障信号，必须新建一条 PENDING 记录重新拉起，不能挂在定型旧任务上。
         boolean reuseOld = !sameFingerprint.isEmpty()
-                && isActiveForReuse(sameFingerprint.get(0));
+                && correlationService.isActiveForReuse(sameFingerprint.get(0));
         // 冷却/重试耗尽期间的同指纹记录绝不作为新任务的载体：它处于 PENDING 或 FAILED，
         // 但语义上「已停止自动处理」。能走到这里说明 checkSuppress 已放行（冷却刚到期），
         // 此时清空轮次标记、以它为新周期起点重新复用；若已耗尽（FAILED）则直接新建。
@@ -518,7 +509,7 @@ public class AlertWebhookService {
                 log.warn("终态死锁打破：旧记录 {} 已 {}（{}），不再复用；新建 PENDING 记录 {} "
                                 + "并重新触发分析（底层服务可能仍在故障） fingerprint={} service={}",
                         sameFingerprint.get(0).getId(), sameFingerprint.get(0).getStatus(),
-                        isStaleTerminal(sameFingerprint.get(0).getStatus())
+                        correlationService.isStaleTerminal(sameFingerprint.get(0).getStatus())
                                 ? "终态失败/复现" : "旧任务已定型",
                         entity.getId(), fingerprint, alert.getServiceName());
             }
@@ -538,7 +529,7 @@ public class AlertWebhookService {
         // 再交给 AlertIngestionService 统一触发 AI 分析（建任务、通知 Agent）。
         // 传 reuseExisting=true：processAlert 内部不再自行新建 AlertEntity，
         // 直接以已有实体（复用主体或刚落库的首条）为锚点建任务并回填 taskId。
-        final String corrKeyForFill = findPendingCorrKey(firstAlertId);
+        final String corrKeyForFill = correlationService.findPendingCorrKey(firstAlertId);
         // 实际落库实体 ID：复用场景下是老记录 ID，首告警场景下就是 firstAlertId
         final String persistedAlertId = entity.getId();
         alertIngestionService.processAlert(alert, true).subscribe(
@@ -549,7 +540,7 @@ public class AlertWebhookService {
         // processAlert 内部异步建任务，这里拿不到 taskId 返回值；
         // 用轮询回填：把聚合键的 "PENDING" 更新为真实 taskId，供窗口内后续告警关联。
         if (corrKeyForFill != null) {
-            fillCorrKeyWithTaskId(corrKeyForFill, persistedAlertId);
+            correlationService.fillCorrKeyWithTaskId(corrKeyForFill, persistedAlertId);
         }
     }
 
@@ -591,119 +582,6 @@ public class AlertWebhookService {
             return Boolean.FALSE;
         }
     }
-
-    /**
-     * 判断某任务是否“仍然值得聚合新告警”。
-     *
-     * 允许合并的状态：
-     * - PENDING / RUNNING / VERIFYING：任务仍在处理中/观察中，新告警并入主任务合理；
-     * - SUCCESS：仅当任务仍处于「回归观察期」（isTaskInObservation=true）时允许合并。
-     *   观察期一旦结束，SUCCESS 任务已定型——后续同服务告警是新的故障信号，
-     *   必须重新建任务重新分析，否则前端看到的永远是旧任务，永远感知不到新告警。
-     *
-     * REJECTED/FAILED/TIMEOUT/REGRESSED 一律放行——上次诊断/修复未成功，
-     * 新告警必须重新建任务并重新审批。
-     */
-    private Boolean taskCanMerge(String taskId) {
-        if (taskId == null || taskId.isBlank()) {
-            return Boolean.FALSE;
-        }
-        try {
-            String status = taskScheduler.getTask(taskId)
-                    .map(t -> t.getStatus())
-                    .block();
-            if (status == null) {
-                return Boolean.FALSE;
-            }
-            String upper = status.toUpperCase();
-            if ("PENDING".equals(upper) || "RUNNING".equals(upper) || "VERIFYING".equals(upper)) {
-                // 仍在处理中：允许聚合，走下方 REJECTED 主告警兜底检查
-            } else if ("SUCCESS".equals(upper)) {
-                // SUCCESS 只允许在观察期内聚合；观察期已结束的任务必须放行，
-                // 否则同服务的新告警全被一条定型任务吞掉（前端永远收不到新分析）。
-                if (!recoveryVerificationService.isTaskInObservation(taskId)) {
-                    log.info("任务 {} 已 SUCCESS 且脱离观察期，拒绝聚合，放行新告警重新建任务",
-                            taskId);
-                    return Boolean.FALSE;
-                }
-            } else {
-                // REJECTED/FAILED/TIMEOUT/REGRESSED 一律返回 false，强制放行并重新建任务
-                return Boolean.FALSE;
-            }
-            // 关键兜底：即使任务状态看起来还“活动”（例如 VERIFYING/SUCCESS 观察期），
-            // 只要它关联的主告警是 REJECTED（用户拒绝过审批），就绝不能聚合——
-            // 拒绝不等于故障消失，必须放行让新告警重新拉起审批。
-            try {
-                String alertId = taskScheduler.getTask(taskId)
-                        .map(t -> t.getAlertId()).block();
-                if (alertId != null && !alertId.isBlank()) {
-                    AlertEntity alert = alertRepository.findById(alertId).orElse(null);
-                    if (alert != null && "REJECTED".equalsIgnoreCase(alert.getStatus())) {
-                        log.warn("[拒绝后再次爆发] 任务 {} 关联主告警为 REJECTED，拒绝聚合并放行新告警", taskId);
-                        return Boolean.FALSE;
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("查询主告警状态失败（按放行处理） taskId={}: {}", taskId, e.getMessage());
-                return Boolean.FALSE;
-            }
-            return Boolean.TRUE;
-        } catch (Exception e) {
-            log.warn("查询任务状态失败（按放行处理） taskId={}: {}", taskId, e.getMessage());
-            return Boolean.FALSE;
-        }
-    }
-
-    /**
-     * 判断旧告警记录是否处于「终态失败/复现」——这类记录绝不能作为聚合载体。
-     *
-     * REJECTED：人工拒绝了修复（或审批超时自动拒绝），但底层服务可能还在崩溃；
-     * FAILED：上次分析/执行失败；
-     * REGRESSED：修复后观察期复现。
-     *
-     * 三种状态都说明「上次处理没成功」，继续把新 firing 聚合进去，前端就永远
-     * 只看到一条失败的老记录，永远收不到新告警——这正是要打破的死锁。
-     */
-    private boolean isStaleTerminal(String status) {
-        if (status == null || status.isBlank()) {
-            return false;
-        }
-        String upper = status.toUpperCase();
-        return "REJECTED".equals(upper) || "FAILED".equals(upper) || "REGRESSED".equals(upper);
-    }
-
-    /**
-     * 判断旧告警记录是否「活跃到可以复用为新告警的载体」。
-     *
-     * 只有状态仍在途/观察期才复用：PENDING、ANALYZING、FIRING、CORRELATED、
-     * VERIFYING，以及仍处观察期的 SUCCESS。
-     * 其余一律走新建：终态失败（REJECTED/FAILED/REGRESSED，isStaleTerminal）、
-     * TIMEOUT、脱离观察期的 SUCCESS —— 旧任务已定型，新 firing 必须建新告警，
-     * 否则前端永远只看到一条定型/失败的老记录。
-     */
-    private boolean isActiveForReuse(AlertEntity record) {
-        if (record == null || record.getStatus() == null || record.getStatus().isBlank()) {
-            return false;
-        }
-        String upper = record.getStatus().toUpperCase();
-        switch (upper) {
-            case "PENDING":
-            case "ANALYZING":
-            case "FIRING":
-            case "CORRELATED":
-            case "VERIFYING":
-                return true;
-            case "SUCCESS":
-                // 观察期内的 SUCCESS 才允许复用（同一条持续故障仍在被回归观察）；
-                // 脱离观察期视为已定型，放行新建。
-                String taskId = record.getTaskId();
-                return taskId != null && !taskId.isBlank()
-                        && recoveryVerificationService.isTaskInObservation(taskId);
-            default:
-                return false;
-        }
-    }
-
     /**
      * 判断要不要打破 webhook:dup 去重。
      *
@@ -732,147 +610,11 @@ public class AlertWebhookService {
             }
             // 任务仍活动（PENDING/RUNNING/SUCCESS 观察期）→ 正常去重；
             // 任务已终态失败（FAILED/REJECTED/REGRESSED/TIMEOUT，即 taskCanMerge=false）→ 打破。
-            return !Boolean.TRUE.equals(taskCanMerge(taskId));
+            return !Boolean.TRUE.equals(correlationService.taskCanMerge(taskId));
         } catch (Exception ex) {
             // 查询失败时保守放行：宁可重复处理也不能吞告警
             log.warn("[Webhook] 打破去重判定异常（放行） fingerprint={}: {}", fingerprint, ex.getMessage());
             return true;
-        }
-    }
-
-    /** 找到该 alertId 占住的聚合键（首条告警在建任务前把 alertId 记在 pendingCorrKeys）。 */
-    private String findPendingCorrKey(String alertId) {
-        return pendingCorrKeys.entrySet().stream()
-                .filter(e -> alertId.equals(e.getValue()))
-                .map(java.util.Map.Entry::getKey)
-                .findFirst()
-                .orElse(null);
-    }
-
-    /**
-     * 回填聚合键：轮询等任务建出来，把值从 "PENDING" 更新为真实 taskId。
-     * 最多等 10 秒（processAlert 的建任务是异步的），拿不到就放弃——
-     * 后续告警会因键值仍是 "PENDING" 不匹配 taskId 而正常各自建任务，退化为无降噪，安全。
-     */
-    private void fillCorrKeyWithTaskId(String corrKey, String alertId) {
-        Mono.defer(() -> taskScheduler.findLatestTaskByAlertId(alertId))
-                .subscribeOn(Schedulers.boundedElastic())
-                .repeatWhenEmpty(longFlux -> longFlux.delayElements(java.time.Duration.ofMillis(500)))
-                .take(java.time.Duration.ofSeconds(10))
-                .subscribe(
-                        task -> {
-                            try {
-                                redisTemplate.opsForValue().set("webhook:corr:" + corrKey, task.getId(),
-                                        java.time.Duration.ofMinutes(correlationWindowMinutes));
-                                pendingCorrKeys.remove(corrKey);
-                                log.info("聚合键已回填 taskId={} corrKey={}", task.getId(), corrKey);
-                            } catch (Exception redisEx) {
-                                // Redis 超时回填失败只是降噪退化为无关联，不影响告警/任务主链路
-                                log.warn("聚合键回填 Redis 异常（降噪退化为无关联，安全） corrKey={}: {}",
-                                        corrKey, redisEx.getMessage());
-                            }
-                        },
-                        e -> log.warn("聚合键回填失败（降噪退化为无关联，安全）: {}", e.getMessage()));
-    }
-
-    /**
-     * 构建降噪聚合键：namespace + pod(去随机后缀) 。
-     * kube-state-metrics 的 pod 名带随机后缀（leaky-app-b7c4d9cf4-zqd24），
-     * 去掉后缀才能把同一 Deployment 的前后多个 Pod 聚到一起。
-     * 没有 namespace/pod 标签的告警返回空串（不参与降噪）。
-     */
-    private String buildCorrelationKey(Map<String, String> labels) {
-        Map<String, String> l = labels != null ? labels : Map.of();
-        String namespace = l.getOrDefault("namespace", "");
-        String pod = l.getOrDefault("pod", "");
-        String podPrefix = pod;
-        // ReplicaSet/Job Pod 名形如 <deploy>-<rs-hash>-<pod-hash>，去掉两段哈希
-        if (podPrefix.contains("-")) {
-            String[] parts = podPrefix.split("-");
-            if (parts.length >= 3) {
-                podPrefix = String.join("-", java.util.Arrays.copyOfRange(parts, 0, parts.length - 2));
-            }
-        }
-        if (namespace.isBlank() && podPrefix.isBlank()) {
-            return "";
-        }
-        return namespace + "|" + (podPrefix.isBlank() ? l.getOrDefault("service", "") : podPrefix);
-    }
-
-    /**
-     * 聚合落库：把被聚合的新告警归并进同服务已有活跃记录（PENDING/FIRING/CORRELATED），
-     * 命中则累加 occurrenceCount；找不到才新建一行 CORRELATED。
-     *
-     * 只在确实拿到主任务 ID（resolvedTaskId 非空）时调用——聚合必须有明确的载体任务，
-     * 否则硬落 CORRELATED 会把一条本应重新触发分析的新告警静默吞掉。
-     */
-    @Transactional
-    private void persistCorrelatedAlert(Alert alert, String taskId, String fingerprint) {
-        try {
-            java.util.List<AlertEntity> activeSameService = alertRepository
-                    .findFirstByServiceNameAndStatusInOrderByCreateTimeDesc(
-                            alert.getServiceName(),
-                            java.util.List.of("PENDING", "FIRING", "CORRELATED"));
-            if (!activeSameService.isEmpty()) {
-                AlertEntity existing = activeSameService.get(0);
-                existing.setTitle(alert.getTitle());
-                existing.setDescription(alert.getDescription());
-                existing.setTimestamp(alert.getTimestamp());
-                existing.setProcessed(true);
-                existing.setStatus("CORRELATED");
-                // CORRELATED 告警的 taskId 指向主任务：前端「查看分析」能直接打开主报告
-                // 仅在确实拿到主任务 ID 时回填；为 null 不覆盖已有值，保护旧关联不丢失。
-                if (taskId != null && (existing.getTaskId() == null || existing.getTaskId().isBlank())) {
-                    existing.setTaskId(taskId);
-                }
-                // 历史 NULL 兼容：用默认值 1，再 +1，避免空指针
-                int next = (existing.getOccurrenceCount() == null ? 1 : existing.getOccurrenceCount()) + 1;
-                existing.setOccurrenceCount(next);
-                alertRepository.save(existing);
-                log.info("聚合去重：更新主告警 {} 为第 {} 次，taskId={} 不再新增行 service={}",
-                        existing.getId(), next, taskId == null ? "?" : taskId, alert.getServiceName());
-            } else {
-                AlertEntity entity = new AlertEntity();
-                entity.setId(alert.getId());
-                entity.setSource(alert.getSource());
-                entity.setSeverity(alert.getSeverity());
-                entity.setTitle(alert.getTitle());
-                entity.setDescription(alert.getDescription());
-                entity.setServiceName(alert.getServiceName());
-                entity.setHost(alert.getHost());
-                entity.setDetail(alert.getDetail());
-                entity.setTimestamp(alert.getTimestamp());
-                entity.setProcessed(true);
-                entity.setStatus("CORRELATED");
-                if (taskId != null) {
-                    entity.setTaskId(taskId);
-                }
-                entity.setCreateTime(LocalDateTime.now());
-                entity.setFingerprint(fingerprint);
-                entity.setOccurrenceCount(1);
-                alertRepository.save(entity);
-            }
-        } catch (Exception e) {
-            log.warn("聚合落库去重失败（回退新建） service={}: {}", alert.getServiceName(), e.getMessage());
-            AlertEntity entity = new AlertEntity();
-            entity.setId(alert.getId());
-            entity.setSource(alert.getSource());
-            entity.setSeverity(alert.getSeverity());
-            entity.setTitle(alert.getTitle());
-            entity.setDescription(alert.getDescription());
-            entity.setServiceName(alert.getServiceName());
-            entity.setHost(alert.getHost());
-            entity.setDetail(alert.getDetail());
-            entity.setTimestamp(alert.getTimestamp());
-            entity.setProcessed(true);
-            entity.setStatus("CORRELATED");
-            if (taskId != null) {
-                entity.setTaskId(taskId);
-            }
-            entity.setCreateTime(LocalDateTime.now());
-            entity.setFingerprint(fingerprint);
-            entity.setOccurrenceCount(1);
-            alertRepository.save(entity);
         }
     }
 
