@@ -86,7 +86,7 @@ opsagent:
     # 允许 AI agent 调用的工具白名单。
     # generic_command（可执行任意 shell 命令）刻意不在其中：工具本身保留，
     # 仍会出现在 /api/tools/list 里，但不暴露给大模型。
-    agent-exposed: restart_service,scale_up,query_log,get_status,rollback,clear_cache,request_human_approval,query_metrics,query_pod_events,query_impact
+    agent-exposed: restart_service,scale_up,query_log,get_status,rollback,clear_cache,request_human_approval,query_metrics,query_pod_events,query_impact,config_rollback,traffic_switch,pod_evict,node_drain,connection_pool,health_check_param
   approval:
     # auto：立即批准但落审计记录；manual：挂起等待外部审批（需要前端配合）
     mode: manual

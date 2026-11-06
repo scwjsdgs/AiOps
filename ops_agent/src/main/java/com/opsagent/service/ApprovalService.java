@@ -479,11 +479,59 @@ public class ApprovalService {
      * 原实现靠 Java 工具阻塞 55 秒轮询 Redis；现在 Python 图在审批节点
      * interrupt() 挂起，这里通过 HTTP 调用 /api/agent/resume 传入决定。
      * 这是异步增强：网络失败时审批仍已终态落库，运维可重放/人工介入。
+     *
+     * 安全校验：调用 Python resume 接口前，将请求体中的 requestId 与挂起的 requestId 比对；
+     * 不匹配时记录警告日志并拒绝调用（直接 return，不抛异常），不影响审批主流程。
      */
-    private void notifyAgentResume(String requestId, boolean approved, String note, String taskId) {
+    void notifyAgentResume(String requestId, boolean approved, String note, String taskId) {
         if (taskId == null || taskId.isBlank()) {
             return;
         }
+
+        // 安全校验：调用 Python resume 接口前，将请求体中的 requestId 与挂起的 requestId 比对；
+        // 不匹配（伪造/过期/跨任务回调）则只记警告并拒绝调用（直接 return，不抛异常），
+        // 不影响审批主流程（审批决定本身已经落库）。
+        try {
+            if (approvalRepository != null) {
+                Approval suspendedApproval = approvalRepository.findById(requestId).orElse(null);
+                if (suspendedApproval == null) {
+                    // 未按 requestId 直接命中时，回退按 taskId 查找挂起/已决审批单
+                    try {
+                        for (Approval candidate : approvalRepository.findAll()) {
+                            if (candidate != null && taskId.equals(candidate.getTaskId())) {
+                                suspendedApproval = candidate;
+                                break;
+                            }
+                        }
+                    } catch (Exception findAllEx) {
+                        log.warn("查找挂起审批单 findAll 异常 taskId={} requestId={}: {}",
+                                taskId, requestId, findAllEx.getMessage());
+                    }
+                }
+                if (suspendedApproval == null) {
+                    log.warn("通知 Python 恢复被拒绝：未找到挂起审批单 requestId={} taskId={}", requestId, taskId);
+                    return;
+                }
+                // 校验 requestId 匹配
+                String suspendedRequestId = suspendedApproval.getRequestId();
+                if (suspendedRequestId == null || !suspendedRequestId.equals(requestId)) {
+                    log.warn("通知 Python 恢复被拒绝：requestId 与挂起审批单不匹配 incoming={} suspended={} taskId={}",
+                            requestId, suspendedRequestId, taskId);
+                    return;
+                }
+                // 校验 taskId 匹配
+                if (suspendedApproval.getTaskId() != null && !suspendedApproval.getTaskId().equals(taskId)) {
+                    log.warn("通知 Python 恢复被拒绝：审批单 taskId 与请求 taskId 不匹配 requestId={} approvalTaskId={} taskId={}",
+                            requestId, suspendedApproval.getTaskId(), taskId);
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("校验挂起审批单 requestId 异常 taskId={} requestId={}: {}", taskId, requestId, e.getMessage());
+            return;
+        }
+
+        // 校验通过，调用 Python resume 接口
         try {
             Map<String, Object> payload = new HashMap<>();
             payload.put("requestId", requestId);

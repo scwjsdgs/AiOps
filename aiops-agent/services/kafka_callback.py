@@ -42,6 +42,7 @@ class KafkaToolCallback:
         self._consumer_task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
         self._waiters: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -112,7 +113,8 @@ class KafkaToolCallback:
         """Kafka 模式执行工具；任何异常都抛给调用方由 HTTP 兜底。"""
         request_id = f"tool-{uuid.uuid4().hex}"
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._waiters[request_id] = future
+        async with self._lock:
+            self._waiters[request_id] = future
         try:
             if not self._ready.is_set() or self._producer is None:
                 raise RuntimeError("Kafka 通道未就绪")

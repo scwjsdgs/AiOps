@@ -12,6 +12,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -66,6 +67,9 @@ public class AlertWebhookService {
     private Counter webhookDuplicate;
     private Counter webhookResolved;
     private Counter webhookCorrelated;
+
+    @Value("")
+    private String escalationTitlePrefix;
 
     /**
      * 窗口内暂存 corrKey -> alertId：首条告警占住聚合键时任务还没建出来
@@ -441,7 +445,7 @@ public class AlertWebhookService {
         int historicalOccurrence = sameFingerprint.isEmpty() || sameFingerprint.get(0).getOccurrenceCount() == null
                 ? 1 : sameFingerprint.get(0).getOccurrenceCount();
         String escalationPrefix = historicalOccurrence >= ESCALATION_OCCURRENCE_THRESHOLD
-                ? ESCALATION_TITLE_PREFIX : "";
+                ? escalationTitlePrefix : "";
 
         // 复用白名单：只有「真正活跃」的记录才值得复用（状态在途或观察期内）。
         // REJECTED/FAILED/REGRESSED 是终态失败/复现（isStaleTerminal）；
@@ -802,6 +806,7 @@ public class AlertWebhookService {
      * 只在确实拿到主任务 ID（resolvedTaskId 非空）时调用——聚合必须有明确的载体任务，
      * 否则硬落 CORRELATED 会把一条本应重新触发分析的新告警静默吞掉。
      */
+    @Transactional
     private void persistCorrelatedAlert(Alert alert, String taskId, String fingerprint) {
         try {
             java.util.List<AlertEntity> activeSameService = alertRepository

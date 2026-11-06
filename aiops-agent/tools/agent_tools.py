@@ -16,6 +16,9 @@ REPAIR_ACTION_MAP = {
     "restart": "restart_service",
     "restart_service": "restart_service",
     "clear_cache": "clear_cache",
+    "rollback": "rollback",
+    "scale_up": "scale_up",
+    "scale_down": "scale_down",
 }
 
 
