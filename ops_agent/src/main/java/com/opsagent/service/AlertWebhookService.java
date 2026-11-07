@@ -4,15 +4,14 @@ import com.opsagent.entity.AlertEntity;
 import com.opsagent.model.Alert;
 import com.opsagent.model.AlertmanagerWebhookPayload;
 import com.opsagent.repository.AlertRepository;
+import com.opsagent.service.FingerprintService;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -37,18 +36,12 @@ public class AlertWebhookService {
 
     private final AlertRepository alertRepository;
     private final AlertIngestionService alertIngestionService;
-    private final StringRedisTemplate redisTemplate;
+    private final FingerprintService fingerprintService;
     private final TaskSchedulerService taskScheduler;
     private final MeterRegistry meterRegistry;
-    private final RecoveryVerificationService recoveryVerificationService;
-    private final AlertLifecycleService alertLifecycleService;
+    private final SuppressionPolicy suppressionPolicy;
+    private final VerificationFirewall verificationFirewall;
     private final CorrelationService correlationService;
-
-    @Value("${opsagent.webhook.idempotency.ttlMinutes:5}")
-    private long idempotencyTtlMinutes;
-
-    @Value("${opsagent.webhook.fingerprint-keys:alertname,instance,severity}")
-    private String fingerprintKeys;
 
     /** 告警降噪聚合窗口（分钟）。0 = 关闭降噪。窗口内同源故障只触发一次 agent 分析。 */
     @Value("${opsagent.webhook.correlation-window-minutes:3}")
@@ -108,8 +101,7 @@ public class AlertWebhookService {
             return;
         }
 
-        String fingerprint = buildFingerprint(amAlert.getLabels());
-        log.info("[Webhook] 生成指纹 fingerprint={}（keys={}）", fingerprint, fingerprintKeys);
+        String fingerprint = fingerprintService.buildFingerprint(amAlert.getLabels());
         if (fingerprint.isBlank()) {
             log.warn("无法生成 fingerprint: labels={}", amAlert.getLabels());
             return;
@@ -137,17 +129,8 @@ public class AlertWebhookService {
         // 判定放行后一路走到建任务流程，绝不再进聚合分支。
         boolean forceRetrigger = false;
         if ("firing".equals(alertStatusLower)) {
-            String dedupKey = "webhook:dup:" + fingerprint;
-            Boolean set = null;
-            try {
-                set = redisTemplate.opsForValue().setIfAbsent(dedupKey, "1",
-                        java.time.Duration.ofMinutes(idempotencyTtlMinutes));
-            } catch (Exception e) {
-                // Redis 挂了/超时：绝不能让去重键异常把告警吞掉。按「键未占用」放行，
-                // 宁可重复处理也不能静默丢失。
-                log.warn("[Webhook] Redis 幂等去重异常（放行本帧） dedupKey={}: {}", dedupKey, e.getMessage());
-            }
-            if (Boolean.FALSE.equals(set)) {
+            boolean deduped = !fingerprintService.tryDedup(fingerprint);
+            if (deduped) {
                 // 关键：dedup 命中 ≠ 一律忽略。若关联的最近任务已经终态失败（FAILED）/
                 // 被拒（REJECTED）/复现（REGRESSED）/任务不存在，说明上次处理没成功，
                 // 这次 firing 是新的故障信号，必须打破去重、重新触发任务，否则告警会被
@@ -155,17 +138,7 @@ public class AlertWebhookService {
                 forceRetrigger = shouldBreachDedup(fingerprint);
                 if (forceRetrigger) {
                     log.info("[Webhook] 幂等命中但关联任务已失败/复现，打破去重重新触发 fingerprint={}", fingerprint);
-                    try {
-                        redisTemplate.delete(dedupKey);
-                    } catch (Exception e) {
-                        log.warn("删除去重键失败 dedupKey={}: {}", dedupKey, e.getMessage());
-                    }
-                    // 重新占位续 TTL，防止并发重发
-                    try {
-                        redisTemplate.opsForValue().set(dedupKey, "1", java.time.Duration.ofMinutes(idempotencyTtlMinutes));
-                    } catch (Exception e) {
-                        log.warn("重建去重键失败 dedupKey={}: {}", dedupKey, e.getMessage());
-                    }
+                    fingerprintService.releaseAndReoccupy(fingerprint);
                 } else {
                     webhookDuplicate.increment();
                     log.info("[Webhook] 幂等命中，去重 firing（关联任务仍活动） fingerprint={}", fingerprint);
@@ -193,8 +166,8 @@ public class AlertWebhookService {
                             .map(t -> {
                                 String taskId = t.getId();
                                 String taskStatus = t.getStatus();
-                                if (recoveryVerificationService.isTaskInObservation(taskId)
-                                        || recoveryVerificationService.isTaskRegressed(taskId)
+                                if (verificationFirewall.isTaskInObservation(taskId)
+                                        || verificationFirewall.isTaskRegressed(taskId)
                                         || "FAILED".equalsIgnoreCase(taskStatus)) {
                                     return Boolean.TRUE;
                                 }
@@ -237,42 +210,39 @@ public class AlertWebhookService {
                     return;
                 }
                 String serviceName = e.getServiceName();
-                recoveryVerificationService.verifyServiceHealthy(serviceName)
-                        .subscribe(healthy -> {
-                            if (!Boolean.TRUE.equals(healthy)) {
-                                // 服务仍有 CrashLoop/副本未就绪：驳回假恢复信号。K8s 不健康就说明
-                                // 故障很严重（旧改 CORRELATED/ANALYZING/VERIFYING 全是不该有的假终态），
-                                // 必须无条件强制打回 PENDING，让前端亮起红灯重新处理，绝不“保持”原状态。
-                                // 若任务处于 VERIFYING 观察期，也不打断它——由 RecoveryVerificationService
-                                // 观察期决出终态；这里只负责把告警状态钉回未解决。
-                                String beforeStatus = e.getStatus();
-                                e.setStatus("PENDING");
-                                e.setProcessed(true);
-                                try {
-                                    alertRepository.save(e);
-                                } catch (Exception saveEx) {
-                                    log.warn("[假恢复拦截] 落库 PENDING 失败 alertId={}: {}", e.getId(), saveEx.getMessage());
-                                }
-                                log.warn("[假恢复拦截] 收到 resolved 信号，但 K8s 真实状态仍不健康，强制打回 PENDING（原 {}）"
-                                                + " fingerprint={} alertId={} service={}",
-                                        beforeStatus, fingerprint, e.getId(), serviceName);
-                                return;
-                            }
-                            e.setStatus("RESOLVED");
-                            e.setProcessed(true);
-                            alertRepository.save(e);
-                            webhookResolved.increment();
-                            log.info("告警 resolved，且 K8s 服务 {} 健康，已更新状态 fingerprint={} alertId={}",
-                                    serviceName, fingerprint, e.getId());
-                        }, err -> {
-                            // 验证异常时保守起见也落 RESOLVED：不能让外部校验失败阻塞告警终态
-                            log.warn("resolved 健康验证异常，按正常 resolved 处理 fingerprint={}: {}",
-                                    fingerprint, err.getMessage());
-                            e.setStatus("RESOLVED");
-                            e.setProcessed(true);
-                            alertRepository.save(e);
-                            webhookResolved.increment();
-                        });
+                Boolean healthy = verificationFirewall.verifyServiceHealthy(serviceName);
+                if (healthy == null) {
+                    // 探测异常：按保守策略落 RESOLVED，不让校验失败阻塞告警终态
+                    log.warn("resolved 健康验证异常，按正常 resolved 处理 fingerprint={}", fingerprint);
+                    e.setStatus("RESOLVED");
+                    e.setProcessed(true);
+                    alertRepository.save(e);
+                    webhookResolved.increment();
+                } else if (!Boolean.TRUE.equals(healthy)) {
+                    // 服务仍有 CrashLoop/副本未就绪：驳回假恢复信号。K8s 不健康就说明
+                    // 故障很严重（旧改 CORRELATED/ANALYZING/VERIFYING 全是不该有的假终态），
+                    // 必须无条件强制打回 PENDING，让前端亮起红灯重新处理，绝不“保持”原状态。
+                    // 若任务处于 VERIFYING 观察期，也不打断它——由 RecoveryVerificationService
+                    // 观察期决出终态；这里只负责把告警状态钉回未解决。
+                    String beforeStatus = e.getStatus();
+                    e.setStatus("PENDING");
+                    e.setProcessed(true);
+                    try {
+                        alertRepository.save(e);
+                    } catch (Exception saveEx) {
+                        log.warn("[假恢复拦截] 落库 PENDING 失败 alertId={}: {}", e.getId(), saveEx.getMessage());
+                    }
+                    log.warn("[假恢复拦截] 收到 resolved 信号，但 K8s 真实状态仍不健康，强制打回 PENDING（原 {}）"
+                                    + " fingerprint={} alertId={} service={}",
+                            beforeStatus, fingerprint, e.getId(), serviceName);
+                } else {
+                    e.setStatus("RESOLVED");
+                    e.setProcessed(true);
+                    alertRepository.save(e);
+                    webhookResolved.increment();
+                    log.info("告警 resolved，且 K8s 服务 {} 健康，已更新状态 fingerprint={} alertId={}",
+                            serviceName, fingerprint, e.getId());
+                }
             }).subscribeOn(Schedulers.boundedElastic()).subscribe();
             return;
         }
@@ -562,9 +532,9 @@ public class AlertWebhookService {
                 return Boolean.FALSE;
             }
             AlertEntity latest = list.get(0);
-            AlertLifecycleService.SuppressAction action = alertLifecycleService.checkSuppress(latest);
-            if (action == AlertLifecycleService.SuppressAction.COOLDOWN
-                    || action == AlertLifecycleService.SuppressAction.EXHAUSTED) {
+            SuppressionPolicy.SuppressAction action = suppressionPolicy.checkSuppress(latest);
+            if (action == SuppressionPolicy.SuppressAction.COOLDOWN
+                    || action == SuppressionPolicy.SuppressAction.EXHAUSTED) {
                 int next = (latest.getOccurrenceCount() == null ? 1 : latest.getOccurrenceCount()) + 1;
                 latest.setOccurrenceCount(next);
                 // 维持未解决语义：EXHAUSTED 时告警已是 FAILED（人工处理态），COOLDOWN 时是 PENDING
@@ -655,13 +625,4 @@ public class AlertWebhookService {
         return alert;
     }
 
-    private String buildFingerprint(Map<String, String> labels) {
-        String[] keys = fingerprintKeys.split(",");
-        StringBuilder sb = new StringBuilder();
-        for (String k : keys) {
-            String v = labels.getOrDefault(k.trim(), "");
-            sb.append(v).append("|");
-        }
-        return sb.toString();
-    }
 }
