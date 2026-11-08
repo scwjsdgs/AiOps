@@ -7,7 +7,7 @@
       <span class="blob blob--3"></span>
     </div>
 
-    <div class="login__panel">
+    <div class="login__panel glass-card">
       <!-- 左侧品牌区：大屏下展示平台定位，小屏隐藏 -->
       <div class="login__brand">
         <div class="brand-logo">
@@ -163,10 +163,10 @@ const handleLogin = async () => {
   display: flex;
   width: 100%;
   max-width: 880px;
-  background: rgba(255, 255, 255, 0.98);
-  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: var(--radius-lg);
   overflow: hidden;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-lg);
 }
 
 /* ---------- 左侧品牌 ---------- */
@@ -183,7 +183,7 @@ const handleLogin = async () => {
 .brand-logo {
   width: 52px;
   height: 52px;
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(135deg, var(--c-primary-light), var(--c-primary-dark));
   display: flex;
   align-items: center;

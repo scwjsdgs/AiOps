@@ -1,47 +1,56 @@
 <template>
-  <div class="page">
-    <!-- 概览：待审批是唯一需要人马上行动的数字，单独突出 -->
-    <el-row :gutter="16">
+  <div class="approvals page">
+    <!-- ============ 概览统计 ============ -->
+    <el-row :gutter="16" class="stats-row">
       <el-col :xs="12" :sm="6">
-        <div class="mini-stat mini-stat--warning">
-          <div class="mini-stat__body">
-            <div class="mini-stat__value">{{ counts.PENDING }}</div>
-            <div class="mini-stat__label">待审批</div>
+        <div class="stat-card stat-card--warning">
+          <div class="stat-card__body">
+            <div class="stat-card__label">待审批</div>
+            <div class="stat-card__value">{{ counts.PENDING }}</div>
           </div>
-          <el-icon class="mini-stat__icon"><Clock /></el-icon>
+          <div class="stat-card__icon">
+            <el-icon :size="26"><Clock /></el-icon>
+          </div>
         </div>
       </el-col>
       <el-col :xs="12" :sm="6">
-        <div class="mini-stat mini-stat--success">
-          <div class="mini-stat__body">
-            <div class="mini-stat__value">{{ counts.APPROVED }}</div>
-            <div class="mini-stat__label">已批准</div>
+        <div class="stat-card stat-card--success">
+          <div class="stat-card__body">
+            <div class="stat-card__label">已批准</div>
+            <div class="stat-card__value">{{ counts.APPROVED }}</div>
           </div>
-          <el-icon class="mini-stat__icon"><CircleCheck /></el-icon>
+          <div class="stat-card__icon">
+            <el-icon :size="26"><CircleCheck /></el-icon>
+          </div>
         </div>
       </el-col>
       <el-col :xs="12" :sm="6">
-        <div class="mini-stat mini-stat--danger">
-          <div class="mini-stat__body">
-            <div class="mini-stat__value">{{ counts.REJECTED }}</div>
-            <div class="mini-stat__label">已拒绝</div>
+        <div class="stat-card stat-card--danger">
+          <div class="stat-card__body">
+            <div class="stat-card__label">已拒绝</div>
+            <div class="stat-card__value">{{ counts.REJECTED }}</div>
           </div>
-          <el-icon class="mini-stat__icon"><CircleClose /></el-icon>
+          <div class="stat-card__icon">
+            <el-icon :size="26"><CircleClose /></el-icon>
+          </div>
         </div>
       </el-col>
       <el-col :xs="12" :sm="6">
-        <div class="mini-stat mini-stat--info">
-          <div class="mini-stat__body">
-            <div class="mini-stat__value">{{ counts.TIMEOUT }}</div>
-            <div class="mini-stat__label">超时拒绝</div>
+        <div class="stat-card stat-card--info">
+          <div class="stat-card__body">
+            <div class="stat-card__label">超时拒绝</div>
+            <div class="stat-card__value">{{ counts.TIMEOUT }}</div>
           </div>
-          <el-icon class="mini-stat__icon"><Timer /></el-icon>
+          <div class="stat-card__icon">
+            <el-icon :size="26"><Timer /></el-icon>
+          </div>
         </div>
       </el-col>
     </el-row>
 
-    <el-card>
-      <div class="page-header" style="margin-bottom: 16px;">
+    <!-- ============ 审批列表卡片 ============ -->
+    <div class="glass-card">
+      <div class="page-header" style="margin-bottom: var(--space-lg);">
         <div>
           <h3 class="page-title">
             <el-icon><Stamp /></el-icon>人工审批
@@ -56,6 +65,7 @@
           <el-switch
             v-model="autoRefresh"
             active-text="自动刷新"
+            inactive-text="手动刷新"
             inline-prompt
             style="--el-switch-on-color: var(--c-primary);"
           />
@@ -63,13 +73,13 @@
         </div>
       </div>
 
-      <!-- 有待审批时给出醒目提示，这页的价值就在于"有人在等" -->
+      <!-- 有待审批时给出醒目提示 -->
       <el-alert
         v-if="counts.PENDING > 0 && filters.status === 'PENDING'"
         type="warning"
         :closable="false"
         show-icon
-        style="margin-bottom: 16px;"
+        style="margin-bottom: var(--space-lg);"
       >
         <template #title>
           当前有 {{ counts.PENDING }} 个高危操作正在等待决策，请在 55 秒内处理，否则将自动拒绝并进入 15 分钟静默冷却期
@@ -86,20 +96,20 @@
         </el-radio-group>
       </div>
 
-      <el-table :data="approvals" v-loading="loading" style="width: 100%; margin-top: 16px;">
-        <el-table-column label="审批单号" width="150">
+      <el-table :data="approvals" v-loading="loading" style="width: 100%; margin-top: var(--space-lg);">
+        <el-table-column label="审批单号" width="160">
           <template #default="{ row }">
             <CopyId :id="row.requestId" />
           </template>
         </el-table-column>
 
-        <el-table-column label="操作内容" min-width="180">
+        <el-table-column label="操作内容" min-width="200">
           <template #default="{ row }">
             <span class="mono op-text">{{ row.operation || '—' }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="申请理由" min-width="260">
+        <el-table-column label="申请理由" min-width="280">
           <template #default="{ row }">
             <el-tooltip :content="row.reason" placement="top-left" :show-after="400" :disabled="!row.reason">
               <span class="cell-desc">{{ row.reason || '—' }}</span>
@@ -107,7 +117,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="状态" width="110">
+        <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <el-tag :type="statusTagType(row.status)" size="small">
               {{ statusText(row.status) }}
@@ -115,7 +125,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="发起时间" width="160">
+        <el-table-column label="发起时间" width="170">
           <template #default="{ row }">
             <el-tooltip :content="formatTime(row.createdAt)" placement="top">
               <span class="cell-time">{{ fromNow(row.createdAt) }}</span>
@@ -123,21 +133,21 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="决策人" width="100">
+        <el-table-column label="决策人" width="110">
           <template #default="{ row }">
             <span v-if="row.decidedBy" class="text-muted">{{ row.decidedBy }}</span>
             <span v-else class="text-muted">—</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="决策备注" min-width="160">
+        <el-table-column label="决策备注" min-width="180">
           <template #default="{ row }">
             <span v-if="row.decisionNote" class="cell-desc">{{ row.decisionNote }}</span>
             <span v-else class="text-muted">—</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
             <template v-if="row.status === 'PENDING'">
               <el-button type="success" size="small" @click="approve(row)">批准</el-button>
@@ -151,7 +161,15 @@
         </el-table-column>
 
         <template #empty>
-          <el-empty :description="filters.status === 'PENDING' ? '当前没有待审批的高危操作' : '暂无审批记录'" />
+          <div class="empty-state" style="padding: 32px 0;">
+            <el-icon size="56" style="color: var(--c-border-soft);"><Stamp /></el-icon>
+            <p class="empty-state__title">
+              {{ filters.status === 'PENDING' ? '当前没有待审批的高危操作' : '暂无审批记录' }}
+            </p>
+            <p class="empty-state__desc">
+              高危操作在执行前会进入人工审批流程，此处会列出待决策的单据。
+            </p>
+          </div>
         </template>
       </el-table>
 
@@ -167,7 +185,7 @@
           @size-change="loadApprovals(1)"
         />
       </div>
-    </el-card>
+    </div>
   </div>
 </template>
 
@@ -190,7 +208,6 @@ const filters = ref({ status: 'PENDING' })
 const loading = ref(false)
 const autoRefresh = ref(true)
 
-// 各状态计数：分别查一次拿到总数，用于顶部卡片（列表分页只给当前页）
 const counts = ref({ PENDING: 0, APPROVED: 0, REJECTED: 0, TIMEOUT: 0 })
 
 const loadCounts = async () => {
@@ -211,7 +228,7 @@ const loadCounts = async () => {
 const statusTagType = (s) => {
   if (s === 'PENDING') return 'warning'
   if (s === 'APPROVED') return 'success'
-  if (s === 'REJECTED') return 'warning'
+  if (s === 'REJECTED') return 'danger'
   if (s === 'TIMEOUT') return 'info'
   return 'info'
 }
@@ -231,9 +248,7 @@ const loadApprovals = async (p = page.value) => {
   } catch {
     approvals.value = []
     total.value = 0
-    // request.js 拦截器已经弹过错误提示，这里不再重复弹
   } finally {
-    // 必须复位 loading，否则表格会一直转圈
     loading.value = false
   }
 }
@@ -284,8 +299,6 @@ const reject = async (row) => {
   }
   try {
     await submitDecision(row.requestId, { approved: false, note: value.trim() })
-    // 拒绝后进入静默冷却（不是彻底终止）：冷却期内同源告警只累计次数，
-    // 冷却结束时若故障仍在持续，系统会自动重新拉起诊断与审批。
     ElMessage.success('已拒绝，进入 15 分钟静默冷却期（期间同源告警只累计次数，不再弹窗）')
     refreshAll()
   } catch {
@@ -297,8 +310,7 @@ const goTask = (taskId) => {
   router.push({ path: '/tasks', query: { id: taskId } })
 }
 
-// 自动刷新：审批有时效（55s 超时），挂在页面上时定期拉取，
-// 否则用户看着"待审批"列表，其实单子已经超时了。
+// 自动刷新：审批有时效（55s 超时），挂在页面上时定期拉取
 let autoTimer = null
 const startAutoRefresh = () => {
   stopAutoRefresh()
@@ -323,55 +335,16 @@ onUnmounted(() => stopAutoRefresh())
 </script>
 
 <style scoped>
-.mini-stat {
+.stats-row > .el-col {
+  display: flex;
+}
+
+.page-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: var(--c-surface);
-  border: 1px solid var(--c-border);
-  border-radius: var(--radius-lg);
-  padding: 16px 18px;
-  box-shadow: var(--shadow-sm);
-  margin-bottom: 16px;
+  gap: 16px;
 }
-
-.mini-stat__value {
-  font-size: 26px;
-  font-weight: 700;
-  line-height: 1.1;
-}
-
-.mini-stat__label {
-  font-size: 12.5px;
-  color: var(--c-text-muted);
-  margin-top: 4px;
-}
-
-/* 同 Alerts：0.16 透明度等于看不见，改为可见的图标徽章 */
-.mini-stat__icon {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 21px;
-  flex-shrink: 0;
-  background: var(--c-info-soft);
-}
-
-.mini-stat--warning .mini-stat__icon { background: var(--c-warning-soft); }
-.mini-stat--success .mini-stat__icon { background: var(--c-success-soft); }
-.mini-stat--primary .mini-stat__icon { background: var(--c-primary-soft); }
-
-.mini-stat--warning .mini-stat__value,
-.mini-stat--warning .mini-stat__icon { color: var(--c-warning); }
-.mini-stat--success .mini-stat__value,
-.mini-stat--success .mini-stat__icon { color: var(--c-success); }
-.mini-stat--danger .mini-stat__value,
-.mini-stat--danger .mini-stat__icon { color: var(--c-danger); }
-.mini-stat--info .mini-stat__value,
-.mini-stat--info .mini-stat__icon { color: var(--c-info); }
 
 .toolbar {
   display: flex;
@@ -417,6 +390,23 @@ onUnmounted(() => stopAutoRefresh())
 .pager {
   display: flex;
   justify-content: flex-end;
-  margin-top: 18px;
+  margin-top: var(--space-lg);
+}
+
+@media (max-width: 768px) {
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .toolbar {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .pager {
+    justify-content: center;
+  }
 }
 </style>

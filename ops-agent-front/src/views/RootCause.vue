@@ -1,7 +1,8 @@
 <template>
-  <div class="page">
-    <el-card>
-      <div class="page-header">
+  <div class="root-cause page">
+    <!-- ============ 根因图谱卡片 ============ -->
+    <div class="glass-card">
+      <div class="page-header" style="margin-bottom: var(--space-lg);">
         <div>
           <h3 class="page-title">
             <el-icon><Connection /></el-icon>告警根因图谱
@@ -11,8 +12,10 @@
           </p>
         </div>
         <div class="toolbar">
-          <el-input v-model="deployment" placeholder="按服务过滤" clearable style="width:220px;" />
-          <el-button type="primary" :icon="Search" :loading="loading" @click="loadGraph">生成图谱</el-button>
+          <el-input v-model="deployment" placeholder="按服务过滤" clearable style="width: 220px;" />
+          <el-button type="primary" :icon="Search" :loading="loading" @click="loadGraph">
+            生成图谱
+          </el-button>
           <el-button :icon="Refresh" @click="loadGraph">刷新</el-button>
         </div>
       </div>
@@ -27,47 +30,50 @@
         </div>
       </div>
       <el-empty v-else-if="!loading" description="暂无根因图谱数据。运行过 AI 诊断后这里会生成传播链" />
-    </el-card>
+    </div>
 
-    <el-card style="margin-top:16px;">
-      <div class="page-header">
+    <!-- ============ 历史相似故障推荐 ============ -->
+    <div class="glass-card">
+      <div class="page-header" style="margin-bottom: var(--space-lg);">
         <div>
-          <h3 class="page-title" style="font-size:15px;">
+          <h3 class="page-title" style="font-size: 15px;">
             <el-icon><List /></el-icon>历史相似故障推荐
           </h3>
-          <span class="text-muted">输入服务名/关键词，推荐历史诊断任务用于二次处置</span>
+          <p class="page-subtitle">
+            输入服务名/关键词，推荐历史诊断任务用于二次处置
+          </p>
         </div>
         <el-button size="small" type="primary" :icon="Search" @click="loadSimilar">推荐</el-button>
       </div>
 
       <div class="similar-form">
-        <el-input v-model="similarDeployment" placeholder="服务名（可选）" clearable style="width:220px;" />
-        <el-input v-model="similarKeyword" placeholder="关键词，如 OOM / CrashLoop" clearable style="width:220px;" />
+        <el-input v-model="similarDeployment" placeholder="服务名（可选）" clearable style="width: 220px;" />
+        <el-input v-model="similarKeyword" placeholder="关键词，如 OOM / CrashLoop" clearable style="width: 220px;" />
       </div>
 
-      <el-table :data="similarTasks" v-loading="similarLoading" style="margin-top:14px;">
-        <el-table-column label="任务 ID" width="170">
+      <el-table :data="similarTasks" v-loading="similarLoading" style="width: 100%; margin-top: var(--space-lg);">
+        <el-table-column label="任务 ID" width="180">
           <template #default="{ row }">
             <span class="mono">{{ row.id?.slice(0, 16) || '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="service" label="服务" width="150" />
-        <el-table-column prop="status" label="状态" width="110">
+        <el-table-column prop="service" label="服务" width="160" />
+        <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <el-tag :type="row.status === 'SUCCESS' ? 'success' : row.status === 'REGRESSED' ? 'danger' : 'info'"
                     size="small">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="关键词" min-width="180">
+        <el-table-column label="关键词" min-width="200">
           <template #default="{ row }">
-            <el-tag v-for="kw in row.keywords" :key="kw" size="small" effect="plain" class="mono kw">
+            <el-tag v-for="kw in row.keywords" :key="kw" size="small" effect="plain" class="kw mono">
               {{ kw }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="recommendation" label="推荐说明" min-width="260" />
+        <el-table-column prop="recommendation" label="推荐说明" />
       </el-table>
-    </el-card>
+    </div>
   </div>
 </template>
 
@@ -192,7 +198,6 @@ const renderGraph = (data) => {
               return d.name
             }
           },
-          // 固定 force，步骤节点围绕任务节点呈葡萄状，不切 circular，避免星环。
           force: {
             repulsion: 800,
             edgeLength: 150,
@@ -321,28 +326,66 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.toolbar { display: flex; gap: 8px; align-items: center; }
-.similar-form { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
-.graph-wrap { position: relative; border: 1px solid var(--c-border); border-radius: var(--radius-md); overflow: hidden; height: 600px; }
-.graph { height: 600px; }
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.similar-form {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.graph-wrap {
+  position: relative;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  height: 600px;
+}
+
+.graph {
+  height: 600px;
+}
+
 .graph-legend {
   position: absolute;
   right: 14px;
   top: 12px;
   display: flex;
   gap: 12px;
-  background: rgba(255,255,255,0.9);
+  background: rgba(255, 255, 255, 0.9);
   border: 1px solid var(--c-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 7px 10px;
   font-size: 12px;
   color: var(--c-text-muted);
 }
-.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+
+.dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+
 .dot--service { background: #2563eb; }
 .dot--alert { background: #ef4444; }
 .dot--step { background: #10b981; }
 .dot--task { background: #f59e0b; }
+
 .mono { font-family: Consolas, monospace; }
 .kw { margin-right: 5px; }
 </style>

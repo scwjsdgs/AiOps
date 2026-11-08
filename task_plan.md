@@ -1,38 +1,66 @@
-# 任务计划：智能运维项目全链路排查（第 1 步：战略侦察，禁止修改代码）
+# 任务计划：智能运维前端界面现代化改造
 
-**目标：** 对当前项目进行全链路排查，输出《待排查清单》，指出哪些模块/文件存在嫌疑，不修改任何业务代码。
-
-**排查重点：**
-1. 全链路隐藏问题：数据流转边界条件、异常捕获遗漏、资源泄漏（连接池/文件句柄）、事务一致性、配置项幽灵依赖
-2. 代码冗余：死代码（无引用）、重复造轮子、过度设计的抽象层
+**目标：** 将当前 Vue3 + Element Plus 前端页面改造成具有现代感、高级感的响应式大屏/仪表盘，并按“架构设计 -> 编码 -> 测试”流水线交付。
 
 **项目模块：**
-- ops_agent：Java 21 后端网关与服务（Spring Boot WebFlux，端口 8081）
-- aiops-agent：Python AI 大脑（FastAPI + LangGraph，端口 5000）
-- ops-agent-front：Vue3 前端控制台（Element Plus，端口 3000）
-- cluster-backup：K8s 监控配置（Prometheus / Alertmanager）
-- docs：详细系统设计、验收指南
+- ops-agent-front：Vue3 + Vite + Element Plus + ECharts，端口 3000
 
 ---
 
-## 阶段
+## 阶段 1：超级头脑风暴与文件规划
 
-| 阶段 | 名称 | 状态 | 下一步 |
-|------|------|------|--------|
-| Phase 1 | 项目结构摸底（读目录、读关键文档） | complete | Java 后端约 70 个 main 文件 + 12 个测试；前端 20+ 个 vue/js；Python agent 在 .venv，需定位源码目录 |
-| Phase 2 | 代码侦察：全链路隐藏问题排查 | complete | 重点阅读 AlertWebhookService、AgentCallbackService、TaskTimeoutScheduler、RecoveryVerificationService、FingerprintService、SuppressionPolicy、CorrelationService、ToolRegistryService |
-| Phase 3 | 代码侦察：代码冗余排查 | complete | 发现 SuppressionPolicy 几乎无自有逻辑、ToolRegistryService 两个 execute 重载轻微冗余、多处 .subscribe() 无处理 Disposable |
-| Phase 4 | 输出《待排查清单》 | complete | 已输出到 findings.md，按模块列出嫌疑文件（致命风险 / 性能隐患 / 冗余清理），等待用户逐个确认 |
+| 子任务 | 内容 | 状态 |
+|--------|------|------|
+| superpowers:brainstorm | 头脑风暴：现代化响应式大屏/仪表盘方案 | complete |
+| planning-with-files | 将 UI 改造计划写入 task_plan.md | complete |
+
+---
+
+## 阶段 2：查新与核心重构
+
+| 子任务 | 内容 | 状态 |
+|--------|------|------|
+| context7 | 查 Vue3/Vite + Element Plus + ECharts 最新规范 | complete |
+| nxtg-forge | 按“架构设计 -> 编码 -> 测试”流水线重构前端 | complete |
+
+**已重构页面：** Dashboard、Alerts、Task、RealTime、Approvals、Login、AuditLogs、RootCause、ChatOps。Tool.vue 已有现代化样式，保留。
+
+---
+
+## 阶段 3：前端美化与代码瘦身
+
+| 子任务 | 内容 | 状态 |
+|--------|------|------|
+| frontend-design | 深度美化 Vue 组件（统一设计系统、玻璃拟态、ECharts 可视化、响应式断点） | complete |
+| code-simplifier | 消除冗余 CSS、深层嵌套、重复样式 | complete |
+
+**设计系统：** theme.css 已收敛为 CSS 变量（主色/语义色/中性色/背景层/圆角/阴影/间距/玻璃拟态/响应式断点/动画）。所有页面引用变量，不再写死色值。
+
+---
+
+## 阶段 4：启动服务、全量截图、扫描与审查
+
+| 子任务 | 内容 | 状态 |
+|--------|------|------|
+| Bash | 启动 Java 后端 (8081)、Python 后端 (5000)、前端 (3000)，curl 验证接口 | in_progress |
+| playwright | 遍历登录页/仪表盘/告警列表，全尺寸截图存到 screenshots/，生成 PREVIEW.md | pending |
+| semgrep | 前端项目安全扫描 | pending |
+| codex | 对抗性审查 | pending |
+| touchstone | CRAP 复杂度检查 | pending |
+
+---
+
+## 阶段 5：文档更新与 GitHub 推送
+
+| 子任务 | 内容 | 状态 |
+|--------|------|------|
+| claude-md-management | 更新 CLAUDE.md：写入新前端规范、screenshots/ 目录说明 | pending |
+| Git | git add / commit / push 到 scwjsdgs/aiops | pending |
 
 ---
 
 ## 决策记录
 
-- 2026-11-07：第 1 步明确禁止修改任何业务代码。所有排查为只读。
-- 2026-11-07：prod-gate 阻塞已解除（`.prod-gates.sh` 配置 COVERAGE_CMD=true，prod-reviewer blessing 已写入 `/tmp/claude-prod-blessing`，哈希 `2e26142560859d6bfa5635274ca75ab7d37f8933`）。
-
----
-
-## Next Step
-
-第 3 步全部完成（8 个模块已修复），等待用户确认后进入第 4 步（门禁硬核兜底、提交）。
+- 2026-11-08：前端现有页面为 Login/Dashboard/Alerts/Approvals/Task/RealTime/Tool/ChatOps/AuditLogs/RootCause，均已读完。Layout 已有深色侧边栏 + 顶栏 + 响应式折叠，可作为现代化基座。
+- UI 改造方向：深色品牌色 + 玻璃拟态卡片 + ECharts 可视化 + 响应式断点 + 统一设计 token，不改动业务逻辑与 API 接口。
+- 环境限制：严禁全局安装依赖，项目内安装必须记入 progress.md，缺依赖必须用 which/where 查本地绝对路径。

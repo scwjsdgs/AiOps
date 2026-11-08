@@ -1,6 +1,6 @@
 <template>
-  <div class="page">
-    <el-card body-style="padding: 0;">
+  <div class="realtime page">
+    <el-card class="glass-card" body-style="padding: 0;">
       <div class="rt-head">
         <div>
           <h3 class="page-title">
@@ -15,7 +15,6 @@
         </div>
 
         <div class="rt-controls">
-          <!-- 任务下拉：免手输 ID。列出进行中与最近的任务，选中即连 -->
           <el-select
             v-model="selectedTaskId"
             filterable
@@ -58,8 +57,6 @@
       </div>
 
       <!-- ============ 进度总览 ============ -->
-      <!-- 改造前这里只有一条裸消息流：用户得自己在滚动文字里拼凑「跑到哪一步了」。
-           现在把状态、进度、耗时、当前动作提炼到顶部，一眼看清 agent 在干什么。 -->
       <div v-if="selectedTaskId" class="rt-progress">
         <div class="rt-progress__stats">
           <div class="rt-stat">
@@ -88,7 +85,7 @@
           </div>
         </div>
 
-        <!-- 当前动作：最新一步的内容，这个是"现在在干嘛"的答案 -->
+        <!-- 当前动作 -->
         <div class="rt-current" :class="`rt-current--${msgKind({ content: currentStep?.content, stepName: currentStep?.stepName })}`">
           <div class="rt-current__head">
             <span class="rt-current__pulse"></span>
@@ -97,7 +94,7 @@
           <div class="rt-current__text">{{ currentStep ? currentStep.content : '等待 agent 输出…' }}</div>
         </div>
 
-        <!-- 进度条：按已完成步骤数估算，收尾时满格 -->
+        <!-- 进度条 -->
         <el-progress
           :percentage="progressPercent"
           :status="progressStatus"
@@ -180,7 +177,7 @@ const loadTaskOptions = async () => {
   }
 }
 
-// 消息按内容分型，左侧色点与连线随之变色
+// 消息按内容分型
 const msgKind = (msg) => {
   const s = `${msg.stepName || ''} ${msg.content || ''}`
   return stepKind(s)
@@ -192,10 +189,6 @@ const currentTask = computed(() =>
 )
 const taskStatus = computed(() => currentTask.value?.status || 'RUNNING')
 
-// 按「stepName + 内容」去重：同一步可能推多条（如先推"准备执行"再推"执行结果"），
-// 进度按"步骤"而非"消息"算。
-// 只用 stepName 做 key 会把两次独立的同类调用（比如连着查两次日志）合并成一步，
-// 步骤数偏少、进度条虚高，所以内容也要参与。
 const steps = computed(() => {
   const seen = new Map()
   messages.value.forEach((m, i) => {
@@ -211,9 +204,6 @@ const toolCallCount = computed(() =>
   messages.value.filter(m => msgKind(m) === 'tool').length
 )
 
-// 进度百分比：已出步骤数 / 预估总步数。
-// 预估来自历史任务的典型步数（多在 6-10 步），封顶 95% ——任务没结束就不该显示 100%，
-// 否则最后一步迟迟不来时会让人误以为已经完成。
 const ESTIMATED_STEPS = 8
 const progressPercent = computed(() => {
   if (isFinished.value) return 100
@@ -231,7 +221,6 @@ const progressStatus = computed(() => {
   return 'exception'
 })
 
-// 已用时：从第一条消息到现在的时长，每 30 秒刷新一次（不需要秒级抖动）
 const now = ref(Date.now())
 let tickTimer = null
 
@@ -250,7 +239,6 @@ const elapsedOf = (idx) => {
   if (!prev?.timestamp || !cur?.timestamp) return ''
   const d = new Date(cur.timestamp).getTime() - new Date(prev.timestamp).getTime()
   if (Number.isNaN(d) || d < 0) return ''
-  // 步间间隔：看得出哪一步"卡"得久
   return d > 1000 ? `+${formatDuration(d)}` : ''
 }
 
@@ -296,8 +284,6 @@ const connect = () => {
 }
 
 const disconnect = () => {
-  // 切回只收广播（审批）的连接，而不是彻底断开：
-  // 完全断开会让审批提醒失效，而那一侧才是 manual 模式的关键路径。
   wsStore.connect('')
   ElMessage.info('已取消任务订阅（审批提醒仍保持连接）')
 }
@@ -313,9 +299,7 @@ const goTask = (id) => {
 
 onMounted(() => {
   loadTaskOptions()
-  // 每 30 秒刷新"已用时"显示。30 秒足够——秒级跳动既无信息量又费渲染。
   tickTimer = setInterval(() => { now.value = Date.now() }, 30000)
-  // 若 URL 里带了任务 ID（从任务页跳来），自动选中并订阅
   const qid = router.currentRoute.value.query.taskId
   if (qid) {
     selectedTaskId.value = String(qid)
@@ -323,16 +307,11 @@ onMounted(() => {
   }
 })
 
-// 离开页面不再断开连接。
-// 改造前这里 disconnect()，导致一离开实时监控页，审批等全局事件就收不到了——
-// 而审批恰恰只给 55 秒窗口，断了就等于必然错过。连接由 Layout 常驻维持，
-// 登出时才关闭。
 onUnmounted(() => {
   if (tickTimer) {
     clearInterval(tickTimer)
     tickTimer = null
   }
-  // 仅停止本地计时，不动 WebSocket
 })
 </script>
 
@@ -342,7 +321,7 @@ onUnmounted(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px;
+  padding: 20px 24px;
   border-bottom: 1px solid var(--c-border);
   flex-wrap: wrap;
 }
@@ -368,7 +347,6 @@ onUnmounted(() => {
   color: var(--c-success);
 }
 
-/* 下拉项：状态 + 摘要 + 时间三段布局 */
 .opt {
   display: flex;
   align-items: center;
@@ -390,7 +368,7 @@ onUnmounted(() => {
 }
 
 .rt-meta {
-  padding: 10px 20px;
+  padding: 10px 24px;
   background: var(--c-primary-soft);
   font-size: 12.5px;
   display: flex;
@@ -400,7 +378,7 @@ onUnmounted(() => {
 
 /* ---------- 进度总览 ---------- */
 .rt-progress {
-  padding: 18px 20px;
+  padding: 18px 24px;
   border-bottom: 1px solid var(--c-border);
   background: var(--c-surface);
 }
@@ -438,7 +416,7 @@ onUnmounted(() => {
   color: var(--c-text);
 }
 
-/* 当前动作：整块着色，跟着消息类型变（工具=蓝 / 错误=红 / 完成=绿） */
+/* 当前动作 */
 .rt-current {
   padding: 12px 14px;
   border-radius: var(--radius-md);
@@ -477,7 +455,6 @@ onUnmounted(() => {
   margin-bottom: 6px;
 }
 
-/* 呼吸点：暗示"正在进行中" */
 .rt-current__pulse {
   width: 7px;
   height: 7px;
@@ -508,7 +485,7 @@ onUnmounted(() => {
   height: calc(100vh - 64px - var(--space-page) * 2 - 220px);
   min-height: 300px;
   overflow-y: auto;
-  padding: 16px 20px;
+  padding: 16px 24px;
   background: var(--c-surface);
 }
 
@@ -566,7 +543,6 @@ onUnmounted(() => {
 .msg--tool .msg__dot { background: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-soft); }
 .msg--error .msg__dot { background: var(--c-danger); box-shadow: 0 0 0 3px var(--c-danger-soft); }
 .msg--approval .msg__dot { background: var(--c-warning); box-shadow: 0 0 0 3px var(--c-warning-soft); }
-/* 修复动作（重启/扩缩容/回滚）与只读查询区分开：它会真的改线上状态 */
 .msg--repair .msg__dot { background: var(--c-success); box-shadow: 0 0 0 3px var(--c-success-soft); }
 
 .msg__body {
@@ -588,7 +564,6 @@ onUnmounted(() => {
   font-family: 'JetBrains Mono', Consolas, monospace;
 }
 
-/* 与上一步的间隔：哪一步耗得久一眼可见 */
 .msg__elapsed {
   font-size: 11px;
   color: var(--c-warning);

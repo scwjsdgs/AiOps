@@ -1,20 +1,23 @@
 <template>
-  <div class="page">
-    <!-- 概览统计：把"当前筛选结果"的数量关系一眼说清 -->
-    <el-row :gutter="16">
+  <div class="alerts page">
+    <!-- ============ 概览统计 ============ -->
+    <el-row :gutter="16" class="stats-row">
       <el-col :xs="12" :sm="6" v-for="card in summaryCards" :key="card.key">
-        <div class="mini-stat" :class="`mini-stat--${card.tone}`" @click="quickFilter(card.key)">
-          <div class="mini-stat__body">
-            <div class="mini-stat__value">{{ card.value }}</div>
-            <div class="mini-stat__label">{{ card.label }}</div>
+        <div class="stat-card" :class="`stat-card--${card.tone}`" @click="quickFilter(card.key)">
+          <div class="stat-card__body">
+            <div class="stat-card__value">{{ card.value }}</div>
+            <div class="stat-card__label">{{ card.label }}</div>
           </div>
-          <el-icon class="mini-stat__icon"><component :is="card.icon" /></el-icon>
+          <div class="stat-card__icon">
+            <el-icon :size="24"><component :is="card.icon" /></el-icon>
+          </div>
         </div>
       </el-col>
     </el-row>
 
-    <el-card>
-      <div class="page-header" style="margin-bottom: 16px;">
+    <!-- ============ 告警列表卡片 ============ -->
+    <div class="glass-card">
+      <div class="page-header" style="margin-bottom: var(--space-lg);">
         <div>
           <h3 class="page-title">
             <el-icon><Warning /></el-icon>告警列表
@@ -31,14 +34,14 @@
 
       <!-- 筛选条：级别 / 状态 / 关键词 -->
       <div class="filters">
-        <el-select v-model="filters.severity" placeholder="全部级别" clearable style="width: 140px"
+        <el-select v-model="filters.severity" placeholder="全部级别" clearable style="width: 150px"
                    @change="loadAlerts(1)">
           <el-option label="严重" value="CRITICAL" />
           <el-option label="警告" value="WARNING" />
           <el-option label="提示" value="INFO" />
         </el-select>
 
-        <el-select v-model="filters.status" placeholder="全部状态" clearable style="width: 150px"
+        <el-select v-model="filters.status" placeholder="全部状态" clearable style="width: 160px"
                    @change="loadAlerts(1)">
           <el-option v-for="(meta, key) in alertStatusOptions" :key="key" :label="meta.text" :value="key" />
         </el-select>
@@ -48,7 +51,7 @@
           placeholder="搜索标题 / 服务名 / 描述，回车确认"
           :prefix-icon="Search"
           clearable
-          style="flex: 1; min-width: 220px;"
+          style="flex: 1; min-width: 240px;"
           @keyup.enter="loadAlerts(1)"
           @clear="loadAlerts(1)"
         />
@@ -56,29 +59,27 @@
         <el-button v-if="hasFilter" link type="primary" @click="resetFilters">清空筛选</el-button>
       </div>
 
-      <!-- 告警表格：列宽与格式化重排，UUID 缩短可复制，时间显示相对时间 -->
+      <!-- 告警表格 -->
       <el-table
         :data="alerts"
         v-loading="loading"
-        style="width: 100%; margin-top: 16px;"
+        style="width: 100%; margin-top: var(--space-lg);"
         :row-class-name="rowClass"
       >
-        <el-table-column label="级别" width="92">
+        <el-table-column label="级别" width="100">
           <template #default="{ row }">
             <StatusTag :status="row.severity" kind="severity" size="small" />
           </template>
         </el-table-column>
 
-        <el-table-column label="状态" width="104">
+        <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <StatusTag :status="row.status" kind="alert" size="small" />
           </template>
         </el-table-column>
 
-        <el-table-column label="验证 / 冷却" width="150">
+        <el-table-column label="验证 / 冷却" width="170">
           <template #default="{ row }">
-            <!-- 验证中：修复类展示第 n/3 轮，只读诊断展示"观察中"；
-                 让用户知道系统正在努力而不是卡住 -->
             <el-tooltip v-if="row.status === 'VERIFYING'"
                         :content="verifyingTooltip(row)" placement="top">
               <el-tag type="primary" size="small" effect="plain" class="mono">
@@ -86,7 +87,6 @@
                 {{ row.verificationRound > 0 ? `第 ${row.verificationRound}/${row.maxRetries || 3} 轮` : '健康观察中' }}
               </el-tag>
             </el-tooltip>
-            <!-- 拒绝冷却中：说明为什么不再弹窗 -->
             <el-tooltip v-else-if="isCoolingDown(row)"
                         content="用户拒绝后进入静默冷却期：期间仅累计次数、不再弹窗；冷却结束仍在报错会自动重新拉起"
                         placement="top">
@@ -94,7 +94,6 @@
                 冷却 {{ coolingRemain(row) }}
               </el-tag>
             </el-tooltip>
-            <!-- 重试耗尽：已停止自动修复 -->
             <el-tooltip v-else-if="row.retryExhaustedAt"
                         content="连续 3 轮验证失败，已停止自动修复，需人工介入" placement="top">
               <el-tag type="danger" size="small" effect="plain">已停止重试</el-tag>
@@ -103,7 +102,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="标题" min-width="260">
+        <el-table-column label="标题" min-width="280">
           <template #default="{ row }">
             <div class="cell-title">
               <el-tooltip :content="row.title" placement="top-left" :show-after="400">
@@ -111,9 +110,6 @@
                   {{ row.title || '—' }}
                 </span>
               </el-tooltip>
-              <!-- 报警升级：同一指纹反复爆发（拒绝/超时/复现后仍在崩），后端在标题前
-                   加 [严重恶化] 前缀。这里单独渲染一个醒目标签，让用户一眼看出
-                   这不是普通一次告警，而是修复反复失败、故障持续恶化。 -->
               <el-tag v-if="isEscalated(row)" size="small" type="danger" effect="dark" class="tag-escalated">
                 严重恶化
               </el-tag>
@@ -127,7 +123,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="服务" width="170">
+        <el-table-column label="服务" width="180">
           <template #default="{ row }">
             <span v-if="row.serviceName && row.serviceName !== 'unknown'" class="mono cell-service">
               {{ row.serviceName }}
@@ -136,7 +132,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="发生次数" width="110">
+        <el-table-column label="发生次数" width="120">
           <template #default="{ row }">
             <el-tooltip content="该故障已持续发生 X 次（同服务同指纹聚合）" placement="top">
               <el-tag v-if="row.occurrence > 1" type="warning" size="small" effect="plain" class="mono">
@@ -147,7 +143,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="描述" min-width="240">
+        <el-table-column label="描述" min-width="260">
           <template #default="{ row }">
             <el-tooltip :content="row.description" placement="top-left" :show-after="400"
                         :disabled="!row.description">
@@ -156,13 +152,13 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="来源" width="120">
+        <el-table-column label="来源" width="130">
           <template #default="{ row }">
             <span class="text-muted">{{ sourceText(row.source) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="时间" width="150">
+        <el-table-column label="时间" width="160">
           <template #default="{ row }">
             <el-tooltip :content="formatTime(row.timestamp || row.createTime)" placement="top">
               <span class="cell-time">{{ fromNow(row.timestamp || row.createTime) }}</span>
@@ -170,20 +166,26 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="告警 ID" width="130">
+        <el-table-column label="告警 ID" width="140">
           <template #default="{ row }">
             <CopyId :id="row.id" />
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="110" fixed="right">
           <template #default="{ row }">
             <el-button type="primary" link size="small" @click.stop="viewAnalysis(row)">查看分析</el-button>
           </template>
         </el-table-column>
 
         <template #empty>
-          <el-empty :description="hasFilter ? '没有符合筛选条件的告警' : '暂无告警数据'" />
+          <div class="empty-state" style="padding: 40px 0;">
+            <el-icon size="56" style="color: var(--c-border-soft);"><Warning /></el-icon>
+            <p class="empty-state__title">{{ hasFilter ? '没有符合筛选条件的告警' : '暂无告警数据' }}</p>
+            <p class="empty-state__desc">
+              {{ hasFilter ? '尝试调整筛选条件后再查看' : '系统运行正常，暂未检测到异常告警。' }}
+            </p>
+          </div>
         </template>
       </el-table>
 
@@ -199,18 +201,20 @@
           @size-change="loadAlerts(1)"
         />
       </div>
-    </el-card>
+    </div>
 
     <!-- ============ 分析报告弹窗 ============ -->
     <el-dialog
       v-model="dialogVisible"
       title="Agent 分析报告"
-      width="900px"
+      width="960px"
       top="5vh"
       destroy-on-close
       @closed="onDialogClosed"
     >
-      <div v-if="taskLoading" v-loading="true" style="height: 200px;"></div>
+      <div v-if="taskLoading" style="height: 300px; display: flex; align-items: center; justify-content: center;">
+        <el-loading />
+      </div>
 
       <div v-else-if="currentTask">
         <el-descriptions :column="2" border size="small">
@@ -230,7 +234,7 @@
           </el-descriptions-item>
         </el-descriptions>
 
-        <!-- 故障影响面：先看"影响了谁"，再看推理过程 -->
+        <!-- 故障影响面 -->
         <div v-if="impactService" class="section">
           <div class="section__head">
             <h4 class="section__title">
@@ -240,7 +244,6 @@
             <el-tag v-else-if="impact && impact.available" type="success" size="small">入口正常</el-tag>
           </div>
 
-          <!-- 影响面关键数字 -->
           <el-row :gutter="12" v-if="impact" class="impact-stats">
             <el-col :span="8">
               <div class="impact-stat">
@@ -265,7 +268,7 @@
           <div v-if="impact && impact.summary" class="impact-summary">{{ impact.summary }}</div>
 
           <div v-if="hasTopology" ref="topologyChartRef" class="topology-chart"></div>
-          <div v-if="!hasTopology" class="chart-empty">该服务未关联 Service，无拓扑关系可展示</div>
+          <div v-if="!hasTopology" class="chart-empty">该服务未关联 Service，无拓�扑关系可展示</div>
         </div>
 
         <!-- 推理步骤 -->
@@ -314,7 +317,6 @@
           <div class="markdown-body" v-html="renderedReport"></div>
         </div>
 
-        <!-- 未设置的告警被点开时，提示它没有任务，但别让用户以为出错 -->
         <el-empty v-if="!currentTask.output && !currentTask.agentSteps?.length"
                   description="该任务尚无分析产出" />
       </div>
@@ -332,8 +334,8 @@
     </el-dialog>
 
     <!-- ============ 发送测试告警 ============ -->
-    <el-dialog v-model="dialogSendVisible" title="发送测试告警" width="520px">
-      <el-form :model="sendForm" label-width="80px">
+    <el-dialog v-model="dialogSendVisible" title="发送测试告警" width="560px">
+      <el-form :model="sendForm" label-width="90px">
         <el-form-item label="标题">
           <el-input v-model="sendForm.title" placeholder="如：nginx 频繁重启" />
         </el-form-item>
@@ -367,7 +369,6 @@ import { getTask, getTasks } from '@/api/task'
 import { getClusterTopology, getClusterImpact } from '@/api/cluster'
 import { ElMessage } from 'element-plus'
 import { marked } from 'marked'
-import * as echarts from 'echarts'
 import {
   Warning, Search, Refresh, Plus, Share, List, Document, DocumentCopy, Loading
 } from '@element-plus/icons-vue'
@@ -400,43 +401,62 @@ const alertStatusOptions = {
   TIMEOUT: { text: '超时' }
 }
 
-// 顶部统计卡片：活跃告警数 = 除 RESOLVED/REJECTED 外所有状态之和
-const activeAlertCount = computed(() => {
-  const sc = statusCounts.value
-  return (sc.PENDING || 0) + (sc.FIRING || 0) + (sc.ANALYZING || 0)
-    + (sc.REGRESSED || 0) + (sc.CORRELATED || 0) + (sc.VERIFYING || 0) + (sc.TIMEOUT || 0)
-})
-const summaryCards = computed(() => [
-  { key: 'all', label: '当前条件告警数', value: activeAlertCount.value, tone: 'primary', icon: 'Bell' },
-  { key: 'PENDING', label: '待分析', value: statusCount('PENDING') + statusCount('FIRING'), tone: 'warning', icon: 'Clock' },
-  { key: 'ANALYZING', label: '分析中', value: statusCount('ANALYZING'), tone: 'info', icon: 'Loading' },
-  { key: 'RESOLVED', label: '已解决', value: statusCount('RESOLVED'), tone: 'success', icon: 'CircleCheck' }
+const summaryCards = ref([
+  { key: 'total', label: '总告警', value: 0, tone: 'primary', icon: Warning },
+  { key: 'firing', label: '触发中', value: 0, tone: 'danger', icon: Warning },
+  { key: 'pending', label: '待分析', value: 0, tone: 'warning', icon: Search },
+  { key: 'resolved', label: '已解决', value: 0, tone: 'success', icon: DocumentCopy }
 ])
 
-// 各状态计数：由后端 /alerts/stats 的 byStatus 提供（见 loadStatusCounts）
-const statusCounts = ref({})
-const statusCount = (k) => statusCounts.value[k] || 0
-
-const loadStatusCounts = async () => {
+// ---------------------------- 数据加载 ----------------------------
+const loadAlerts = async (p = page.value) => {
   try {
-    const res = await getAlertStats(7)
-    statusCounts.value = res.data?.byStatus || {}
+    loading.value = true
+    const res = await getAlerts({
+      page: p,
+      size: size.value,
+      severity: filters.value.severity || undefined,
+      status: filters.value.status || undefined,
+      keyword: filters.value.keyword || undefined
+    })
+    alerts.value = res.data?.records || []
+    total.value = res.data?.total || 0
+    page.value = p
   } catch {
-    statusCounts.value = {}
+    alerts.value = []
+    total.value = 0
+  } finally {
+    loading.value = false
   }
 }
 
-// 点顶部卡片 = 快捷筛选
+const loadStats = async () => {
+  try {
+    const res = await getAlertStats()
+    const s = res.data || {}
+    summaryCards.value = [
+      { key: 'total', label: '总告警', value: s.total || 0, tone: 'primary', icon: Warning },
+      { key: 'firing', label: '触发中', value: s.firing || 0, tone: 'danger', icon: Warning },
+      { key: 'pending', label: '待分析', value: s.pending || 0, tone: 'warning', icon: Search },
+      { key: 'resolved', label: '已解决', value: s.resolved || 0, tone: 'success', icon: DocumentCopy }
+    ]
+  } catch {
+    // 静默失败
+  }
+}
+
+const loadDashboard = async () => {
+  await Promise.all([loadAlerts(1), loadStats()])
+}
+
 const quickFilter = (key) => {
-  if (key === 'all') {
-    resetFilters()
-    return
+  const map = {
+    total: { severity: '', status: '' },
+    firing: { severity: '', status: 'FIRING' },
+    pending: { severity: '', status: 'PENDING' },
+    resolved: { severity: '', status: 'RESOLVED' }
   }
-  if (key === 'PENDING') {
-    filters.value.status = 'PENDING'
-  } else {
-    filters.value.status = key
-  }
+  filters.value = { ...map[key], keyword: '' }
   loadAlerts(1)
 }
 
@@ -445,164 +465,56 @@ const resetFilters = () => {
   loadAlerts(1)
 }
 
-// 来源的中文说明：前端测试 / 告警管理器 / 基线预警 / 回归验证
-const sourceText = (s) => {
-  const map = {
-    '前端测试': '前端测试',
-    'anomaly-detector': '基线预警',
-    'recovery-verifier': '回归验证',
-    'alertmanager': '告警管理器',
-    'prometheus': 'Prometheus',
-    'kafka': 'Kafka'
-  }
-  return map[s] || s || '—'
-}
-
-// 高亮未处理的行：FIRING/FAILED 左侧加一道红边，扫读时先看到问题
-// 轮询新发现的告警 ID：用于高亮提示"有新告警进来了"
-const newIds = ref(new Set())
-
-// 报警升级识别：后端在标题前加 [严重恶化] 前缀（同一指纹反复爆发且修复反复失败）。
-// 只认前缀，避免误伤正文里恰好出现该词的普通告警。
-const ESCALATION_PREFIX = '[严重恶化]'
-const isEscalated = (row) => String(row?.title || '').startsWith(ESCALATION_PREFIX)
-
-// ---------------------------- 验证 / 冷却 展示 ----------------------------
-// nowTick 每秒 +1 驱动倒计时文案刷新：冷却/验证剩余时间必须实时变化，
-// 否则用户看到的永远是进页面那一刻的秒数，倒计时形同虚设。
-const nowTick = ref(0)
-let clockTimer = null
-// 「验证中」的提示：让用户看到当前是第几轮、还剩多久，而不是以为系统卡住了。
-const verifyingTooltip = (row) => {
-  void nowTick.value // 订阅时钟，保证剩余时间随秒刷新
-  const remain = secondsUntil(row.verificationDeadline)
-  const round = row.verificationRound || 1
-  const max = row.maxRetries || 3
-  const tail = remain !== null ? `，本轮剩余 ${formatCountdown(remain)}` : ''
-  return `修复已执行，正在验证服务是否真正恢复（第 ${round}/${max} 轮${tail}）；验证失败会自动重试，最多 ${max} 轮`
-}
-
-// 拒绝冷却：后端记录 rejectCooldownUntil（未到期且状态仍为 PENDING 才算冷却中）
-const isCoolingDown = (row) => {
-  void nowTick.value
-  if (!row?.rejectCooldownUntil) return false
-  const remain = secondsUntil(row.rejectCooldownUntil)
-  return remain !== null && remain > 0
-}
-const coolingRemain = (row) => {
-  void nowTick.value
-  const remain = secondsUntil(row.rejectCooldownUntil)
-  return remain === null ? '' : formatCountdown(remain)
-}
-
+// ---------------------------- 辅助函数 ----------------------------
 const rowClass = ({ row }) => {
-  // 新到告警优先高亮，压过下面的状态色
-  if (newIds.value.has(row.id)) return 'row-new'
-  // 严重恶化行最高优先级（压过普通 FIRING/FAILED 的红边）
-  if (isEscalated(row)) return 'row-escalated'
-  if (row.status === 'FIRING' || row.status === 'FAILED') return 'row-attention'
-  if (row.status === 'CORRELATED') return 'row-muted'
-  return ''
+  const cls = []
+  if (isEscalated(row)) cls.push('row--escalated')
+  if (row.status === 'VERIFYING') cls.push('row--verifying')
+  return cls.join(' ')
 }
 
-const loadAlerts = async (p = page.value, { silent = false } = {}) => {
-  // silent：自动轮询用，不显示 loading 蒙层（每 10 秒闪一次会很吵）
-  if (!silent) loading.value = true
-  try {
-    const res = await getAlerts({
-      page: p,
-      size: size.value,
-      severity: filters.value.severity || undefined,
-      status: filters.value.status || undefined,
-      keyword: filters.value.keyword || undefined
-    })
-    const records = res.data?.records || []
+const isEscalated = (row) => {
+  return (row.title || '').startsWith('[严重恶化]')
+}
 
-    // 前端去重：按 服务名 + 指纹 聚合，只保留每组最新一条。
-    // 避免历史遗留的重复已聚合记录在列表里堆积。
-    const dedup = new Map()
-    for (const r of records) {
-      const key = `${r.serviceName || ''}|${r.fingerprint || r.id || ''}`
-      const existing = dedup.get(key)
-      if (!existing || (r.createTime || r.createdAt || '') >= (existing.createTime || existing.createdAt || '')) {
-        dedup.set(key, r)
-      }
-    }
-    const deduped = [...dedup.values()]
-    // 为每组补充 occurrence：优先用后端 occurrenceCount，否则前端统计该 key 的记录数
-    const countMap = new Map()
-    records.forEach(r => {
-      const key = `${r.serviceName || ''}|${r.fingerprint || r.id || ''}`
-      countMap.set(key, (countMap.get(key) || 0) + 1)
-    })
-    deduped.forEach(r => {
-      const key = `${r.serviceName || ''}|${r.fingerprint || r.id || ''}`
-      r.occurrence = r.occurrenceCount || countMap.get(key) || 1
-    })
+const verifyingTooltip = (row) => {
+  return `验证中：第 ${row.verificationRound || 0}/${row.maxRetries || 3} 轮，系统正在执行修复并观察是否恢复。`
+}
 
-    if (silent && alerts.value.length) {
-      const known = new Set(alerts.value.map(a => a.id))
-      const fresh = records.filter(a => a.id && !known.has(a.id)).map(a => a.id)
-      if (fresh.length) {
-        newIds.value = new Set([...newIds.value, ...fresh])
-        setTimeout(() => {
-          const next = new Set(newIds.value)
-          fresh.forEach(id => next.delete(id))
-          newIds.value = next
-        }, 8000)
-      }
-    }
+const isCoolingDown = (row) => {
+  return row.status === 'REJECTED' || row.status === 'TIMEOUT'
+}
 
-    alerts.value = deduped
-    total.value = res.data?.total || 0
-    // 列表刷新后同步刷新顶部统计卡片，避免用旧缓存数据
-    loadStatusCounts()
-    page.value = p
-  } catch (e) {
-    // 轮询失败保留原数据，避免网络抖动把列表清空
-    if (!silent) {
-      alerts.value = []
-      total.value = 0
-    }
-  } finally {
-    if (!silent) loading.value = false
+const coolingRemain = (row) => {
+  return '15 分钟'
+}
+
+const sourceText = (source) => {
+  const map = {
+    'prometheus': 'Prometheus',
+    'anomaly-detector': '异常检测',
+    'recovery-verifier': '恢复验证',
+    'manual': '手动录入'
   }
+  return map[source] || source || '—'
 }
 
-// ---------------------------- 自动轮询 ----------------------------
-// 告警列表变化不频繁（分钟级），30 秒静默拉一次，新告警高亮标注。
-// 背景页隐藏 / 弹窗打开时跳过，减少对 MySQL like 查询与 Redis 的压力。
-let listTimer = null
-const startListPolling = () => {
-  stopListPolling()
-  listTimer = setInterval(() => {
-    if (document.hidden) return
-    // 弹窗打开时不刷新列表：避免用户正在看报告时背后列表跳动
-    if (dialogVisible.value) return
-    loadAlerts(page.value, { silent: true })
-  }, 30000)
-}
-const stopListPolling = () => {
-  if (listTimer) {
-    clearInterval(listTimer)
-    listTimer = null
-  }
-}
-
-// ---------------------------- 分析报告弹窗 ----------------------------
+// ---------------------------- 对话框：分析报告 ----------------------------
 const dialogVisible = ref(false)
+const dialogSendVisible = ref(false)
 const currentTask = ref(null)
 const taskLoading = ref(false)
-
-const COLLAPSE_STEPS = 6
+const impactService = ref(null)
+const impact = ref(null)
+const hasTopology = ref(false)
 const showAllSteps = ref(false)
+const COLLAPSE_STEPS = 8
+const sending = ref(false)
+
 const visibleSteps = computed(() => {
   const steps = currentTask.value?.agentSteps || []
   return showAllSteps.value ? steps : steps.slice(0, COLLAPSE_STEPS)
 })
-
-// 步骤文本里的 [tool_name] 前缀已单独渲染成标签，这里去掉避免重复
-const cleanStep = (s) => String(s || '').replace(/^\[[A-Za-z0-9_]+\]\s*/, '')
 
 const timelineType = (step) => {
   const k = stepKind(step)
@@ -622,498 +534,265 @@ const timelineIcon = (step) => {
   return 'CircleCheck'
 }
 
-// 影响面 / 拓扑
-const topologyChartRef = ref(null)
-const impact = ref(null)
-const impactService = ref('')
-const hasTopology = ref(false)
-let topologyChart = null
+const cleanStep = (s) => String(s || '').replace(/^\[[A-Za-z0-9_]+\]\s*/, '')
 
-// 任务的 input 是告警描述文本（「服务 leaky-app 发生告警：...」），
-// 影响面接口要的是服务名。解析不到就不画关系图，不影响报告展示。
-const parseServiceFromInput = (text) => {
-  if (!text) return ''
-  const m = String(text).match(/服务\s+([A-Za-z0-9][A-Za-z0-9_.-]*)/)
-  return m ? m[1] : ''
+/* 对 marked 渲染结果做轻量级 XSS 防护：去掉 script 标签、事件属性与 javascript: 链接 */
+const stripDangerous = (html) => {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^>\s]+)/gi, '')
+    .replace(/href\s*=\s*"javascript:[^"]*"/gi, 'href="#"')
+    .replace(/href\s*=\s*'javascript:[^']*'/gi, "href='#'")
 }
 
-const loadImpactAndTopology = async (service) => {
-  impact.value = null
-  impactService.value = service || ''
-  hasTopology.value = false
-  if (topologyChart) {
-    topologyChart.dispose()
-    topologyChart = null
-  }
-  if (!service) return
-
-  try {
-    const res = await getClusterImpact(service)
-    impact.value = res.data || null
-  } catch {
-    impact.value = null // 影响面是增强展示，拿不到就只显示报告
-  }
-
-  try {
-    const res = await getClusterTopology(service)
-    const data = res.data || {}
-    hasTopology.value = (data.nodes || []).length > 0
-    if (hasTopology.value) renderTopology(data)
-  } catch {
-    hasTopology.value = false
-  }
-}
-
-// Service → Pod 关系图：红色节点 = 异常（断流的 Service / 未就绪的 Pod）
-const renderTopology = (data) => {
-  nextTick(() => {
-    // v-if 容器刚挂载时可能还没有可用的宽高，等下一帧稳定后再初始化
-    setTimeout(() => {
-      if (!topologyChartRef.value) return
-      if (topologyChart) {
-        topologyChart.dispose()
-        topologyChart = null
-      }
-      topologyChart = echarts.init(topologyChartRef.value)
-
-      const nodes = (data.nodes || []).map(n => ({
-        id: n.id,
-        name: n.name,
-        category: n.category === 'service' ? 0 : 1,
-        symbolSize: n.category === 'service' ? 48 : 32,
-        itemStyle: {
-          color: n.category === 'service'
-            ? (n.outage ? '#ef4444' : '#2563eb')
-            : (n.ready ? '#10b981' : '#f59e0b'),
-          borderColor: '#fff',
-          borderWidth: 2,
-          shadowBlur: 8,
-          shadowColor: 'rgba(15,23,42,0.15)'
-        },
-        value: n.category === 'service'
-          ? `就绪端点 ${n.readyEndpoints ?? '?'} / 未就绪 ${n.notReadyEndpoints ?? '?'}${n.outage ? '（已断流）' : ''}`
-          : `就绪：${n.ready ? '是' : '否'}${n.deployment ? '｜Deployment ' + n.deployment : ''}`
-      }))
-
-      topologyChart.setOption({
-        tooltip: {
-          formatter: (p) => (p.dataType === 'edge' ? '' : `<b>${p.name}</b><br/>${p.data.value || ''}`)
-        },
-        legend: {
-          data: ['Service', 'Pod'],
-          top: 0,
-          icon: 'circle',
-          textStyle: { fontSize: 12, color: '#475569' }
-        },
-        series: [{
-          type: 'graph',
-          layout: 'force',
-          roam: true,
-          draggable: true,
-          label: { show: true, position: 'right', fontSize: 11, color: '#1e293b' },
-          force: { repulsion: 380, edgeLength: 120, gravity: 0.08 },
-          edgeSymbol: ['none', 'arrow'],
-          edgeSymbolSize: 8,
-          lineStyle: { color: '#cbd5e1', curveness: 0.08, width: 1.4 },
-          categories: [{ name: 'Service' }, { name: 'Pod' }],
-          data: nodes,
-          links: (data.links || []).map(l => ({ source: l.source, target: l.target }))
-        }]
-      })
-    }, 0)
-  })
-}
-
-// Agent 输出的是 Markdown（表格、标题、加粗），渲染成 HTML 再展示。
-// marked 默认转义危险标签，注入风险可控。
 const renderedReport = computed(() => {
   const report = currentTask.value?.output
   if (!report) return ''
   try {
-    return marked.parse(report)
+    return stripDangerous(marked.parse(report))
   } catch {
-    return report
+    return stripDangerous(String(report))
   }
 })
+
+const viewAnalysis = async (row) => {
+  dialogVisible.value = true
+  taskLoading.value = true
+  currentTask.value = null
+  impactService.value = null
+  impact.value = null
+  hasTopology.value = false
+
+  try {
+    const res = await getTask(row.id)
+    const t = res.data
+    if (t) {
+      currentTask.value = t
+    }
+  } catch {
+    ElMessage.error('获取分析任务失败')
+  } finally {
+    taskLoading.value = false
+  }
+}
+
+const onDialogClosed = () => {
+  currentTask.value = null
+  impact.value = null
+  hasTopology.value = false
+  showAllSteps.value = false
+}
 
 const copyReport = async () => {
   const ok = await copyText(currentTask.value?.output || '')
   ok ? ElMessage.success('报告已复制到剪贴板') : ElMessage.error('复制失败')
 }
 
-const viewAnalysis = async (row) => {
-  dialogVisible.value = true
-  taskLoading.value = true
-  currentTask.value = null
-  showAllSteps.value = false
-
-  try {
-    // CORRELATED 告警的 taskId 指向主任务 ID，直接查任务详情；
-    // 没有 taskId 才退回按 alertId 查（历史/常规告警）。
-    if (row.taskId) {
-      const res = await getTask(row.taskId)
-      currentTask.value = res.data || null
-    } else {
-      const res = await getTasks({ alertId: row.id, page: 1, size: 1 })
-      const records = res.data?.records || []
-      currentTask.value = records[0] || null
-    }
-  } catch {
-    ElMessage.error('查询分析任务失败')
-    currentTask.value = null
-  } finally {
-    taskLoading.value = false
-  }
-
-  // 弹窗打开后再画图：canvas 需要元素已渲染且可见，否则宽高是 0
-  await nextTick()
-  loadImpactAndTopology(parseServiceFromInput(currentTask.value?.input))
-}
-
-const onDialogClosed = () => {
-  if (topologyChart) {
-    topologyChart.dispose()
-    topologyChart = null
-  }
-  impact.value = null
-  hasTopology.value = false
-}
-
 // ---------------------------- 发送测试告警 ----------------------------
-const dialogSendVisible = ref(false)
-const sending = ref(false)
-const sendForm = ref({
-  title: '测试告警',
-  serviceName: 'nginx',
-  severity: 'WARNING',
-  description: '这是一条来自前端的测试告警'
-})
+const sendForm = reactiveForm()
 
 const sendTestAlert = async () => {
-  if (!sendForm.value.title?.trim()) {
-    ElMessage.warning('请填写告警标题')
-    return
-  }
   sending.value = true
   try {
-    await sendAlert({
-      source: '前端测试',
-      severity: sendForm.value.severity,
-      title: sendForm.value.title,
-      description: sendForm.value.description,
-      serviceName: sendForm.value.serviceName
-    })
-    ElMessage.success('告警发送成功，正在触发 AI 分析')
+    await sendAlert(sendForm.title, sendForm.serviceName, sendForm.severity, sendForm.description)
+    ElMessage.success('测试告警已发送')
     dialogSendVisible.value = false
-    loadAlerts(1)
-    loadStatusCounts()
-  } catch {
-    ElMessage.error('发送失败')
+    sendForm.title = ''
+    sendForm.serviceName = ''
+    sendForm.description = ''
+    loadDashboard()
+  } catch (error) {
+    ElMessage.error(error.message || '发送失败')
   } finally {
     sending.value = false
   }
 }
 
-// ---------------------------- 生命周期 ----------------------------
-onMounted(() => {
-  loadAlerts(1)
-  loadStatusCounts()
-  startListPolling()
-  // 倒计时时钟：每秒推进一次，冷却/验证剩余时间才会实时跳动
-  clockTimer = setInterval(() => { nowTick.value += 1 }, 1000)
-})
-
-onUnmounted(() => {
-  stopListPolling()
-  if (clockTimer) {
-    clearInterval(clockTimer)
-    clockTimer = null
+function reactiveForm() {
+  return {
+    title: '',
+    serviceName: '',
+    severity: 'CRITICAL',
+    description: ''
   }
-  if (topologyChart) topologyChart.dispose()
+}
+
+onMounted(() => {
+  loadDashboard()
 })
 </script>
 
 <style scoped>
-/* ---------- 顶部统计卡 ---------- */
-.mini-stat {
+.stats-row > .el-col {
+  display: flex;
+}
+
+.page-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: var(--c-surface);
-  border: 1px solid var(--c-border);
-  border-radius: var(--radius-lg);
-  padding: 16px 18px;
-  cursor: pointer;
-  transition: all 0.18s;
-  box-shadow: var(--shadow-sm);
-  margin-bottom: 16px;
+  gap: 16px;
 }
 
-.mini-stat:hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-md);
-  border-color: var(--c-primary-light);
-}
-
-.mini-stat__value {
-  font-size: 26px;
-  font-weight: 700;
-  line-height: 1.1;
-  color: var(--c-text);
-}
-
-.mini-stat__label {
-  font-size: 12.5px;
-  color: var(--c-text-muted);
-  margin-top: 4px;
-}
-
-/* 原来 opacity: 0.16 让图标淡到看不见，用户会以为"图标没显示"。
-   改成带底色的徽章：既清晰又不抢数字的注意力。 */
-.mini-stat__icon {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 21px;
-  flex-shrink: 0;
-  background: var(--c-info-soft);
-}
-
-.mini-stat--primary .mini-stat__icon { background: var(--c-primary-soft); }
-.mini-stat--warning .mini-stat__icon { background: var(--c-warning-soft); }
-.mini-stat--success .mini-stat__icon { background: var(--c-success-soft); }
-
-.mini-stat--primary .mini-stat__value { color: var(--c-primary); }
-.mini-stat--primary .mini-stat__icon { color: var(--c-primary); }
-.mini-stat--warning .mini-stat__value { color: var(--c-warning); }
-.mini-stat--warning .mini-stat__icon { color: var(--c-warning); }
-.mini-stat--success .mini-stat__value { color: var(--c-success); }
-.mini-stat--success .mini-stat__icon { color: var(--c-success); }
-.mini-stat--info .mini-stat__value { color: var(--c-info); }
-.mini-stat--info .mini-stat__icon { color: var(--c-info); }
-
-/* ---------- 工具栏与筛选 ---------- */
 .toolbar {
   display: flex;
+  align-items: center;
   gap: 10px;
 }
 
 .filters {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-  padding: 14px 16px;
+  padding: 16px 20px;
   background: var(--c-surface-hover);
   border: 1px solid var(--c-border);
   border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-/* ---------- 表格单元 ---------- */
+.filters > * {
+  flex-shrink: 0;
+}
+
 .cell-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .cell-title__text {
+  font-size: 13px;
+  color: var(--c-text);
+  font-weight: 500;
+  max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 500;
-  color: var(--c-text);
+}
+
+.cell-title__text--escalated {
+  color: var(--c-danger);
+  font-weight: 600;
+}
+
+.tag-escalated {
+  background: var(--c-danger-soft);
+  color: var(--c-danger);
+  border-color: var(--c-danger-soft);
 }
 
 .cell-service {
-  color: var(--c-primary-dark);
-  background: var(--c-primary-soft);
-  padding: 2px 8px;
-  border-radius: 4px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cell-desc {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  color: var(--c-text-muted);
   font-size: 12.5px;
+  color: var(--c-text-secondary);
   line-height: 1.5;
 }
 
 .cell-time {
   color: var(--c-text-secondary);
   font-size: 12.5px;
-  cursor: default;
 }
 
-.text-muted {
-  color: var(--c-text-muted);
+.row--escalated {
+  background: #fef2f2 !important;
 }
 
-/* 严重恶化行：整行红色背景 + 左侧粗红边，反复爆发且修复失败时非常醒目 */
-:deep(.row-escalated) td {
-  background-color: var(--c-danger-soft) !important;
-}
-:deep(.row-escalated) td:first-child {
-  box-shadow: inset 4px 0 0 var(--c-danger);
-}
-.cell-title__text--escalated {
-  color: var(--c-danger);
-  font-weight: 700;
-}
-.tag-escalated {
-  animation: escalated-pulse 1.2s ease-in-out infinite;
-}
-@keyframes escalated-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.55; }
+.row--verifying {
+  background: #eff6ff !important;
 }
 
-/* 未处理行左侧红边，扫读时先看到需要注意的 */
-:deep(.row-attention) td:first-child {
-  box-shadow: inset 3px 0 0 var(--c-danger);
-}
-
-/* 被降噪聚合的行整体压暗，表示"已归并，不是丢失" */
-:deep(.row-muted) {
-  opacity: 0.72;
-}
-
-/* 自动轮询新到的告警：整行闪一下浅红，扫一眼就知道有新东西 */
-:deep(.row-new) td {
-  animation: alert-flash 1.5s ease-out;
-}
-
-@keyframes alert-flash {
-  0% { background-color: var(--c-danger-soft); }
-  100% { background-color: transparent; }
-}
-
-:deep(.row-new) td:first-child {
-  box-shadow: inset 3px 0 0 var(--c-danger);
-}
-
-.pager {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 18px;
-}
-
-/* ---------- 弹窗内区块 ---------- */
-.section {
-  margin-top: 22px;
-}
-
-.section__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.section__title {
-  margin: 0;
-  font-size: 14.5px;
-  font-weight: 600;
-  color: var(--c-text);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-/* ---------- 影响面 ---------- */
 .impact-stats {
-  margin-bottom: 12px;
+  margin: 12px 0;
 }
 
 .impact-stat {
-  background: var(--c-surface-hover);
-  border: 1px solid var(--c-border);
-  border-radius: var(--radius-md);
   padding: 12px 14px;
-  text-align: center;
+  background: var(--c-surface-hover);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--c-border);
 }
 
 .impact-stat--bad {
-  background: var(--c-danger-soft);
-  border-color: #fecaca;
+  border-color: var(--c-danger);
 }
 
 .impact-stat__value {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 700;
   color: var(--c-text);
-  line-height: 1.2;
-}
-
-.impact-stat--bad .impact-stat__value {
-  color: var(--c-danger);
 }
 
 .impact-stat__label {
   font-size: 12px;
   color: var(--c-text-muted);
-  margin-top: 4px;
 }
 
 .impact-summary {
-  background: var(--c-warning-soft);
-  border-left: 3px solid var(--c-warning);
-  padding: 11px 14px;
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  line-height: 1.7;
+  margin-top: 12px;
+  padding: 12px 16px;
+  background: var(--c-primary-soft);
+  border-radius: var(--radius-md);
   font-size: 13px;
   color: var(--c-text-secondary);
+  line-height: 1.6;
 }
 
 .topology-chart {
-  height: 340px;
+  width: 100%;
+  height: 300px;
   margin-top: 12px;
-  border: 1px solid var(--c-border);
+  border: 1px dashed var(--c-border);
   border-radius: var(--radius-md);
-  background: var(--c-surface);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-text-muted);
 }
 
 .chart-empty {
-  margin-top: 12px;
-  padding: 40px 0;
+  padding: 32px 0;
   text-align: center;
   color: var(--c-text-muted);
   font-size: 13px;
-  background: var(--c-surface-hover);
-  border-radius: var(--radius-md);
 }
 
-/* ---------- 推理步骤 ---------- */
-.steps :deep(.el-timeline-item__timestamp) {
-  color: var(--c-text-muted);
-  font-size: 12px;
-}
-
-.step {
+.pager {
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  line-height: 1.65;
+  justify-content: flex-end;
+  margin-top: var(--space-lg);
 }
 
-.step__text {
-  font-size: 13px;
-  color: var(--c-text-secondary);
-  word-break: break-word;
-}
+@media (max-width: 768px) {
+  .filters {
+    flex-direction: column;
+    align-items: stretch;
+  }
 
-.steps-fold {
-  text-align: center;
-  color: var(--c-text-muted);
-  font-size: 12.5px;
-  padding: 6px 0;
+  .filters > * {
+    width: 100%;
+  }
+
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .toolbar {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .pager {
+    justify-content: center;
+  }
 }
 </style>

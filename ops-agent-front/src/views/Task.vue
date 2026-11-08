@@ -1,12 +1,13 @@
 <template>
-  <div class="task-layout">
-    <!-- ============ 左：任务列表（免输入 ID，直接点选） ============ -->
+  <div class="task page">
+    <!-- ============ 左：任务列表 ============ -->
     <el-card class="list-panel" body-style="padding: 0;">
-      <div class="list-panel__head">
-        <h3 class="page-title" style="font-size: 15px;">
-          <el-icon><List /></el-icon>任务列表
+      <div class="list-panel__head glass-card__body">
+        <div class="list-panel__title">
+          <el-icon size="16"><List /></el-icon>
+          <span>任务列表</span>
           <el-tag size="small" type="info" effect="plain">{{ total }}</el-tag>
-        </h3>
+        </div>
         <el-button :icon="Refresh" circle size="small" @click="loadTasks(1)" :loading="loading" />
       </div>
 
@@ -22,7 +23,7 @@
           @clear="loadTasks(1)"
         />
         <el-select v-model="filters.status" placeholder="全部状态" clearable size="small"
-                   style="width: 110px; margin-top: 8px;" @change="loadTasks(1)">
+                   style="width: 130px; margin-top: 8px;" @change="loadTasks(1)">
           <el-option label="排队中" value="PENDING" />
           <el-option label="分析中" value="RUNNING" />
           <el-option label="验证中" value="VERIFYING" />
@@ -96,10 +97,6 @@
         <div class="detail-head">
           <div>
             <h3 class="page-title" style="font-size: 15px;">
-              <!-- 从首页/告警页跳进来时给出返回入口：原先没有任何返回按钮，
-                   用户点进详情后只能靠浏览器后退键，很不方便。
-                   图标传组件对象（ArrowLeft），不用字符串名 —— 字符串在
-                   el-button 的 icon 属性上不渲染，这是"图标不显示"的常见成因。 -->
               <el-button
                 v-if="cameFromOtherPage"
                 link
@@ -127,7 +124,7 @@
 
         <el-scrollbar class="detail-scroll">
           <div class="detail-content">
-            <!-- 验证中提示：轮次 + 倒计时，让用户知道系统正在验证而不是卡住 -->
+            <!-- 验证中提示 -->
             <VerifyStatusBar
               v-if="currentTask.status === 'VERIFYING'"
               :round="Number(currentTask.verificationRound) || 0"
@@ -164,7 +161,7 @@
               </el-descriptions-item>
             </el-descriptions>
 
-            <!-- 修复后复现的提示条：这是独立语义，必须显式说明 -->
+            <!-- 修复后复现的提示条 -->
             <el-alert
               v-if="currentTask.status === 'REGRESSED'"
               type="error"
@@ -260,23 +257,15 @@ const filters = ref({ status: '', keyword: '' })
 
 const hasFilter = computed(() => !!(filters.value.status || filters.value.keyword))
 
-// 任务列表已下推到后端过滤（status/keyword），前端不再本地筛。
-// 改造前这里对已取回的一页做 filter，搜索只能命中当前页 12 条，
-// 用户搜不到明明存在的任务，体感就是"搜索坏了"。
-
-// 取输入的第一行做列表摘要：任务 input 可能是很长的多段文本
 const firstLine = (text) => {
   if (!text) return '（无输入）'
   const line = String(text).split('\n').map(s => s.trim()).filter(Boolean)[0] || ''
   return line.length > 90 ? line.slice(0, 90) + '…' : line
 }
 
-// 本轮拉取比上次多出来的任务 ID：用于高亮"新任务"。
-// 只标记真正新增的，不是每次轮询都把整页闪一遍。
 const newIds = ref(new Set())
 
 const loadTasks = async (p = page.value, { silent = false } = {}) => {
-  // silent：自动轮询调用，不显示 loading 蒙层，避免每 10 秒闪一下
   if (!silent) loading.value = true
   try {
     const params = { page: p, size }
@@ -291,7 +280,6 @@ const loadTasks = async (p = page.value, { silent = false } = {}) => {
       const fresh = records.filter(t => t.id && !known.has(t.id)).map(t => t.id)
       if (fresh.length) {
         newIds.value = new Set([...newIds.value, ...fresh])
-        // 高亮 6 秒后自动褪去，避免列表长期挂着标记
         setTimeout(() => {
           const next = new Set(newIds.value)
           fresh.forEach(id => next.delete(id))
@@ -304,7 +292,6 @@ const loadTasks = async (p = page.value, { silent = false } = {}) => {
     total.value = res.data?.total || 0
     page.value = p
   } catch {
-    // 轮询失败不清空已有数据：网络抖动不该让列表变空
     if (!silent) {
       tasks.value = []
       total.value = 0
@@ -314,14 +301,11 @@ const loadTasks = async (p = page.value, { silent = false } = {}) => {
   }
 }
 
-// ---------------------------- 自动轮询 ----------------------------
-// 任务列表变化不频繁（分钟级），30 秒静默刷新一次；新任务自动出现并高亮。
-// 背景页隐藏时跳过，减少对 Redis SCAN 的无效压力。
+// 自动轮询
 let listTimer = null
 const startListPolling = () => {
   stopListPolling()
   listTimer = setInterval(() => {
-    // 用户正在输入搜索词时不要打断（避免列表在打字过程中跳变）
     if (document.hidden) return
     loadTasks(page.value, { silent: true })
   }, 30000)
@@ -333,7 +317,6 @@ const stopListPolling = () => {
   }
 }
 
-// 搜索防抖：输入停顿 400ms 再请求，避免每敲一个字打一次后端
 let searchTimer = null
 const onFilterChange = () => {
   if (searchTimer) clearTimeout(searchTimer)
@@ -354,6 +337,15 @@ const visibleSteps = computed(() => {
 })
 
 const cleanStep = (s) => String(s || '').replace(/^\[[A-Za-z0-9_]+\]\s*/, '')
+
+/* 对 marked 渲染结果做轻量级 XSS 防护：去掉 script 标签、事件属性与 javascript: 链接 */
+const stripDangerous = (html) => {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^>\s]+)/gi, '')
+    .replace(/href\s*=\s*"javascript:[^"]*"/gi, 'href="#"')
+    .replace(/href\s*=\s*'javascript:[^']*'/gi, "href='#'")
+}
 
 const timelineType = (step) => {
   const k = stepKind(step)
@@ -377,9 +369,9 @@ const renderedReport = computed(() => {
   const report = currentTask.value?.output
   if (!report) return ''
   try {
-    return marked.parse(report)
+    return stripDangerous(marked.parse(report))
   } catch {
-    return report
+    return stripDangerous(String(report))
   }
 })
 
@@ -396,8 +388,6 @@ const stopPolling = () => {
   polling.value = false
 }
 
-// 未到终态就每 3 秒续查：agent 分析要几十秒到几分钟，
-// 不轮询的话用户得一直手动点刷新。
 const startPolling = (id) => {
   stopPolling()
   polling.value = true
@@ -407,7 +397,6 @@ const startPolling = (id) => {
       const t = res.data
       if (!t) return
       currentTask.value = t
-      // 顺带把列表里的状态刷新，避免左右两边状态不一致
       const idx = tasks.value.findIndex(x => x.id === id)
       if (idx >= 0) tasks.value[idx] = { ...tasks.value[idx], ...t }
       if (isFinalTaskStatus(t.status)) {
@@ -420,16 +409,9 @@ const startPolling = (id) => {
   }, 3000)
 }
 
-// 点选任务：直接用列表里已有的数据渲染，未到终态再补一次全量拉取
-/**
- * 是否从别的页面跳进来（首页"查看完整报告"、告警页"查看分析"）——
- * 这类进入方式会在 query 里带 id 或 alertId，此时给出返回入口。
- * 直接在左侧列表点选不算，那种情况没有"上一页"可回。
- */
 const cameFromOtherPage = ref(false)
 
 const goBack = () => {
-  // 有历史就回上一页，没有（直接粘贴链接进来）则回首页兜底
   if (window.history.length > 1) {
     router.back()
   } else {
@@ -439,18 +421,15 @@ const goBack = () => {
 
 const selectTask = async (t) => {
   showAllSteps.value = false
-  // 从左侧列表点选：这是页内操作，没有"上一页"可返回，
-  // 即使用户是先跳进来再点列表，返回按钮也应随之收起。
   cameFromOtherPage.value = false
   currentTask.value = t
-  // 更新地址栏，便于刷新后仍停留在同一任务、也便于分享链接
   router.replace({ path: '/tasks', query: { id: t.id } })
 
   try {
     const res = await getTask(t.id)
     if (res.data) currentTask.value = res.data
   } catch {
-    // 详情拉取失败时保留列表数据，至少能看到摘要
+    // 详情拉取失败时保留列表数据
   }
 
   if (!isFinalTaskStatus(currentTask.value?.status)) {
@@ -475,11 +454,9 @@ const goAlert = (alertId) => {
   router.push({ path: '/alerts', query: { alertId } })
 }
 
-// 支持外部页面（如 Dashboard 一键诊断、告警页）带 ?id= 直达
 const loadByIdFromQuery = async () => {
   const id = route.query.id
   if (!id) return
-  // 带 id 进来说明是从别的页面跳转过来的，显示返回按钮
   cameFromOtherPage.value = true
   try {
     const res = await getTask(id)
@@ -493,14 +470,12 @@ const loadByIdFromQuery = async () => {
   }
 }
 
-// ---------------------------- 生命周期 ----------------------------
 onMounted(async () => {
   await loadTasks(1)
   await loadByIdFromQuery()
   startListPolling()
 })
 
-// Dashboard 等页面再次跳进来（组件已挂载）时，query 变化要跟着切
 watch(() => route.query.id, (id) => {
   if (id && id !== currentTask.value?.id) {
     loadByIdFromQuery()
@@ -515,7 +490,6 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* 左右分栏：列表固定宽，详情占满剩余；两栏各自滚动，互不影响 */
 .task-layout {
   display: grid;
   grid-template-columns: 400px 1fr;
@@ -540,6 +514,19 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.list-panel__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.list-panel__title .el-icon {
+  color: var(--c-primary);
+}
+
 .verify-round-tag {
   margin-left: 8px;
   font-size: 12px;
@@ -552,6 +539,9 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--c-border);
   flex-shrink: 0;
   background: var(--c-surface-hover);
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
 }
 
 .list-panel__scroll {
@@ -588,16 +578,15 @@ onUnmounted(() => {
   border-left-color: var(--c-primary);
 }
 
-/* 轮询发现的新任务：短暂高亮 + 左侧红边，6 秒后自动褪去 */
 .task-item--new {
-  background: var(--c-danger-soft, #fef2f2);
-  border-left-color: var(--c-danger, #ef4444);
+  background: var(--c-danger-soft);
+  border-left-color: var(--c-danger);
   animation: task-flash 1.2s ease-out;
 }
 
 @keyframes task-flash {
-  0% { background: var(--c-danger, #ef4444); }
-  100% { background: var(--c-danger-soft, #fef2f2); }
+  0% { background: var(--c-danger); }
+  100% { background: var(--c-danger-soft); }
 }
 
 .task-item__new-tag {
@@ -674,7 +663,6 @@ onUnmounted(() => {
   gap: 8px;
 }
 
-/* 返回按钮跟在标题前，右侧一条分隔竖线，视觉上归入标题区 */
 .detail-head__back {
   font-size: 13px;
   margin-right: 8px;
@@ -760,7 +748,7 @@ onUnmounted(() => {
   color: var(--c-text-muted);
 }
 
-/* 窄屏：上下堆叠，列表限高 */
+/* 窄屏：上下堆叠 */
 @media (max-width: 1100px) {
   .task-layout {
     grid-template-columns: 1fr;

@@ -1,7 +1,23 @@
 <template>
-  <div class="page">
-    <el-card>
-      <div class="page-header">
+  <div class="audit page">
+    <!-- ============ 概览统计 ============ -->
+    <el-row :gutter="16" class="stats-row" v-if="Object.keys(stats).length">
+      <el-col :xs="12" :sm="6" v-for="(count, key) in stats" :key="key">
+        <div class="stat-card stat-card--primary">
+          <div class="stat-card__body">
+            <div class="stat-card__label">{{ categoryLabel(key) }}（近 7 天）</div>
+            <div class="stat-card__value">{{ count }}</div>
+          </div>
+          <div class="stat-card__icon">
+            <el-icon :size="26"><Stamp /></el-icon>
+          </div>
+        </div>
+      </el-col>
+    </el-row>
+
+    <!-- ============ 审计列表卡片 ============ -->
+    <div class="glass-card">
+      <div class="page-header" style="margin-bottom: var(--space-lg);">
         <div>
           <h3 class="page-title">
             <el-icon><Stamp /></el-icon>安全审计
@@ -16,17 +32,8 @@
         </div>
       </div>
 
-      <el-row :gutter="12" v-if="Object.keys(stats).length">
-        <el-col :xs="12" :sm="6" v-for="(count, key) in stats" :key="key">
-          <div class="mini-stat">
-            <div class="mini-stat__value">{{ count }}</div>
-            <div class="mini-stat__label">{{ categoryLabel(key) }}（近 7 天）</div>
-          </div>
-        </el-col>
-      </el-row>
-
       <div class="filters">
-        <el-select v-model="filters.category" clearable placeholder="操作类型" style="width:150px"
+        <el-select v-model="filters.category" clearable placeholder="操作类型" style="width: 150px"
                    @change="loadAudit(1)">
           <el-option label="登录" value="LOGIN" />
           <el-option label="告警" value="ALERT" />
@@ -36,11 +43,11 @@
           <el-option label="混沌" value="CHAOS" />
         </el-select>
         <el-input v-model="filters.keyword" placeholder="搜索操作者 / 动作 / 对象" clearable
-                  style="flex:1;min-width:220px;" @keyup.enter="loadAudit(1)" @clear="loadAudit(1)" />
+                  style="flex: 1; min-width: 240px;" @keyup.enter="loadAudit(1)" @clear="loadAudit(1)" />
         <el-button type="primary" :icon="Search" @click="loadAudit(1)">查询</el-button>
       </div>
 
-      <el-table :data="records" v-loading="loading" style="margin-top:16px;">
+      <el-table :data="records" v-loading="loading" style="width: 100%; margin-top: var(--space-lg);">
         <el-table-column label="时间" width="170">
           <template #default="{ row }">
             <span class="text-muted">{{ formatTime(row.timestamp) }}</span>
@@ -51,11 +58,11 @@
             <el-tag size="small" effect="plain">{{ row.category }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="action" label="动作" min-width="150" />
+        <el-table-column prop="action" label="动作" min-width="160" />
         <el-table-column prop="operator" label="操作者" width="130" />
         <el-table-column prop="channel" label="通道" width="100" />
-        <el-table-column prop="target" label="目标" min-width="200" />
-        <el-table-column label="结果" width="90">
+        <el-table-column prop="target" label="目标" min-width="220" />
+        <el-table-column label="结果" width="100">
           <template #default="{ row }">
             <el-tag :type="row.success ? 'success' : 'danger'" size="small">
               {{ row.success ? '成功' : '失败' }}
@@ -65,13 +72,20 @@
       </el-table>
 
       <div class="pager">
-        <el-pagination v-model:current-page="page" v-model:page-size="size" :total="total"
-                       layout="total, sizes, prev, pager, next" background
-                       @current-change="loadAudit" @size-change="loadAudit(1)" />
+        <el-pagination
+          v-model:current-page="page"
+          v-model:page-size="size"
+          :total="total"
+          layout="total, sizes, prev, pager, next"
+          background
+          @current-change="loadAudit"
+          @size-change="loadAudit(1)"
+        />
       </div>
-    </el-card>
+    </div>
 
-    <el-dialog v-model="replayVisible" title="记录操作回放" width="520px">
+    <!-- ============ 记录操作回放 ============ -->
+    <el-dialog v-model="replayVisible" title="记录操作回放" width="560px">
       <el-form label-position="top">
         <el-form-item label="动作名称">
           <el-input v-model="replayForm.action" placeholder="如：manual_drain_drill" />
@@ -158,16 +172,71 @@ onMounted(() => loadAudit(1))
 </script>
 
 <style scoped>
-.toolbar { display: flex; gap: 8px; }
-.filters { display: flex; gap: 12px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
-.mini-stat {
-  background: var(--c-surface);
+.stats-row > .el-col {
+  display: flex;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.filters {
+  padding: 12px 16px;
+  background: var(--c-surface-hover);
   border: 1px solid var(--c-border);
   border-radius: var(--radius-md);
-  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
-.mini-stat__value { font-size: 20px; font-weight: 700; color: var(--c-primary); }
-.mini-stat__label { font-size: 12px; color: var(--c-text-muted); margin-top: 2px; }
-.pager { display: flex; justify-content: flex-end; margin-top: 18px; }
-.text-muted { color: var(--c-text-muted); }
+
+.filters > * {
+  flex-shrink: 0;
+}
+
+.pager {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-lg);
+}
+
+.text-muted {
+  color: var(--c-text-muted);
+}
+
+@media (max-width: 768px) {
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .toolbar {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .filters {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filters > * {
+    width: 100%;
+  }
+
+  .pager {
+    justify-content: center;
+  }
+}
 </style>
