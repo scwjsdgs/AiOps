@@ -208,9 +208,10 @@ public class AgentCallbackService {
                             })
                             .then();
                 })
-                // 任务不存在（Redis 已过期等）不影响任务完成回调本身
+                // 任务不存在（Redis 已过期等）不影响任务完成回调本身，
+                // 但需明确标记告警回写失败，便于运维定位告警滞后问题。
                 .onErrorResume(e -> {
-                    log.warn("回写告警终态时任务查询失败 taskId={}", taskId, e);
+                    log.error("回写告警终态时任务查询失败（告警可能滞后） taskId={}: {}", taskId, e.getMessage());
                     return Mono.empty();
                 })
                 .then();
@@ -250,24 +251,22 @@ public class AgentCallbackService {
                     ? alertLifecycleService.maxRounds() : Math.max(1, alert.getMaxRetries());
             int round = alertLifecycleService.beginVerification(alert, startedAt, deadline);
             if (approvedRepair) {
-                taskScheduler.appendStep(taskId,
-                        "[verify] 修复已执行，进入验证期：第 " + round + "/" + max
-                                + " 轮，观察 " + observeMinutes + " 分钟后给出结论").subscribe();
-                taskScheduler.markVerifying(taskId, round, max, startedAt, deadline,
-                        "修复已执行，等待 " + observeMinutes + " 分钟验证结果").subscribe();
+                recordVerifyStep(taskId, "[verify] 修复已执行，进入验证期：第 " + round + "/" + max
+                        + " 轮，观察 " + observeMinutes + " 分钟后给出结论");
+                markVerifying(taskId, round, max, startedAt, deadline,
+                        "修复已执行，等待 " + observeMinutes + " 分钟验证结果");
                 log.info("[验证] 任务 {} 进入 VERIFYING 第 {}/{} 轮，截止 {}", taskId, round, max, deadline);
             } else {
                 // 只读诊断：不占轮次预算，但同样给前端一个验证倒计时
-                taskScheduler.appendStep(taskId,
-                        "[verify] 诊断完成，进入 " + observeMinutes + " 分钟健康观察").subscribe();
-                taskScheduler.markVerifying(taskId, 0, max, startedAt, deadline,
-                        "诊断完成，观察服务是否恢复").subscribe();
+                recordVerifyStep(taskId, "[verify] 诊断完成，进入 " + observeMinutes + " 分钟健康观察");
+                markVerifying(taskId, 0, max, startedAt, deadline,
+                        "诊断完成，观察服务是否恢复");
                 log.info("[验证] 只读诊断任务 {} 进入观察期，截止 {}", taskId, deadline);
             }
         }, () -> {
             // 告警读不到（极少数异常路径）：至少要保证任务不是假的 SUCCESS
-            taskScheduler.markVerifying(taskId, approvedRepair ? 1 : 0,
-                    alertLifecycleService.maxRounds(), startedAt, deadline, "等待验证结果").subscribe();
+            markVerifying(taskId, approvedRepair ? 1 : 0,
+                    alertLifecycleService.maxRounds(), startedAt, deadline, "等待验证结果");
             log.warn("[验证] 任务 {} 找不到关联告警 {}，仅标记任务 VERIFYING", taskId, alertId);
         });
     }
@@ -347,6 +346,26 @@ public class AgentCallbackService {
                 .subscribe(
                         v -> log.warn("[重试耗尽] 任务 {} 已置 FAILED 并输出最终失败报告", taskId),
                         e -> log.warn("[重试耗尽] 标记任务 FAILED 失败 taskId={}: {}", taskId, e.getMessage()));
+    }
+
+    /** 记录验证期步骤，异常只记日志，不阻塞主链路。 */
+    private void recordVerifyStep(String taskId, String step) {
+        taskScheduler.appendStep(taskId, step)
+                .subscribeOn(Schedulers.boundedElastic())
+                .subscribe(
+                        v -> { },
+                        e -> log.warn("记录验证期步骤失败 taskId={}: {}", taskId, e.getMessage()));
+    }
+
+    /** 标记任务进入验证期，异常只记日志，不阻塞主链路。 */
+    private void markVerifying(String taskId, int round, int max,
+                               java.time.LocalDateTime startedAt, java.time.LocalDateTime deadline,
+                               String note) {
+        taskScheduler.markVerifying(taskId, round, max, startedAt, deadline, note)
+                .subscribeOn(Schedulers.boundedElastic())
+                .subscribe(
+                        v -> { },
+                        e -> log.warn("标记任务验证期失败 taskId={}: {}", taskId, e.getMessage()));
     }
 
     /** 把 AgentMessage 压成一行便于前端展示与排查的摘要。 */

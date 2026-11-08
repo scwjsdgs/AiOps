@@ -11,9 +11,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import reactor.core.Disposable;
 
 import java.time.LocalDateTime;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 告警降噪聚合服务（从 AlertWebhookService 抽出，纯结构重构，逻辑不变）。
@@ -32,6 +34,9 @@ public class CorrelationService {
     private final StringRedisTemplate redisTemplate;
     private final TaskSchedulerService taskScheduler;
     private final RecoveryVerificationService recoveryVerificationService;
+
+    /** 回填聚合键的定时订阅，任务完成后自动取消，避免资源泄漏。 */
+    private final Map<String, Disposable> fillSubscriptions = new ConcurrentHashMap<>();
 
     /** 告警降噪聚合窗口（分钟）。0 = 关闭降噪。 */
     @Value("${opsagent.webhook.correlation-window-minutes:3}")
@@ -68,7 +73,7 @@ public class CorrelationService {
      * 后续告警会因键值仍是 "PENDING" 不匹配 taskId 而正常各自建任务，退化为无降噪，安全。
      */
     public void fillCorrKeyWithTaskId(String corrKey, String alertId) {
-        Mono.defer(() -> taskScheduler.findLatestTaskByAlertId(alertId))
+        Disposable d = Mono.defer(() -> taskScheduler.findLatestTaskByAlertId(alertId))
                 .subscribeOn(Schedulers.boundedElastic())
                 .repeatWhenEmpty(longFlux -> longFlux.delayElements(java.time.Duration.ofMillis(500)))
                 .take(java.time.Duration.ofSeconds(10))
@@ -83,9 +88,16 @@ public class CorrelationService {
                                 // Redis 超时回填失败只是降噪退化为无关联，不影响告警/任务主链路
                                 log.warn("聚合键回填 Redis 异常（降噪退化为无关联，安全） corrKey={}: {}",
                                         corrKey, redisEx.getMessage());
+                            } finally {
+                                // 回填完成（成功或 Redis 异常）后立即取消订阅，避免资源泄漏
+                                fillSubscriptions.remove(corrKey);
                             }
                         },
-                        e -> log.warn("聚合键回填失败（降噪退化为无关联，安全）: {}", e.getMessage()));
+                        e -> {
+                            log.warn("聚合键回填失败（降噪退化为无关联，安全）: {}", e.getMessage());
+                            fillSubscriptions.remove(corrKey);
+                        });
+        fillSubscriptions.put(corrKey, d);
     }
 
     // ===== 判定 =====
@@ -207,47 +219,34 @@ public class CorrelationService {
                 log.info("聚合去重：更新主告警 {} 为第 {} 次，taskId={} 不再新增行 service={}",
                         existing.getId(), next, taskId == null ? "?" : taskId, alert.getServiceName());
             } else {
-                AlertEntity entity = new AlertEntity();
-                entity.setId(alert.getId());
-                entity.setSource(alert.getSource());
-                entity.setSeverity(alert.getSeverity());
-                entity.setTitle(alert.getTitle());
-                entity.setDescription(alert.getDescription());
-                entity.setServiceName(alert.getServiceName());
-                entity.setHost(alert.getHost());
-                entity.setDetail(alert.getDetail());
-                entity.setTimestamp(alert.getTimestamp());
-                entity.setProcessed(true);
-                entity.setStatus("CORRELATED");
-                if (taskId != null) {
-                    entity.setTaskId(taskId);
-                }
-                entity.setCreateTime(LocalDateTime.now());
-                entity.setFingerprint(fingerprint);
-                entity.setOccurrenceCount(1);
-                alertRepository.save(entity);
+                alertRepository.save(buildCorrelatedEntity(alert, taskId, fingerprint));
             }
         } catch (Exception e) {
             log.warn("聚合落库去重失败（回退新建） service={}: {}", alert.getServiceName(), e.getMessage());
-            AlertEntity entity = new AlertEntity();
-            entity.setId(alert.getId());
-            entity.setSource(alert.getSource());
-            entity.setSeverity(alert.getSeverity());
-            entity.setTitle(alert.getTitle());
-            entity.setDescription(alert.getDescription());
-            entity.setServiceName(alert.getServiceName());
-            entity.setHost(alert.getHost());
-            entity.setDetail(alert.getDetail());
-            entity.setTimestamp(alert.getTimestamp());
-            entity.setProcessed(true);
-            entity.setStatus("CORRELATED");
-            if (taskId != null) {
-                entity.setTaskId(taskId);
-            }
-            entity.setCreateTime(LocalDateTime.now());
-            entity.setFingerprint(fingerprint);
-            entity.setOccurrenceCount(1);
-            alertRepository.save(entity);
+            alertRepository.save(buildCorrelatedEntity(alert, taskId, fingerprint));
         }
+    }
+
+    /** 构建聚合告警实体：公共字段由外部设置，重复代码在此集中。 */
+    private AlertEntity buildCorrelatedEntity(Alert alert, String taskId, String fingerprint) {
+        AlertEntity entity = new AlertEntity();
+        entity.setId(alert.getId());
+        entity.setSource(alert.getSource());
+        entity.setSeverity(alert.getSeverity());
+        entity.setTitle(alert.getTitle());
+        entity.setDescription(alert.getDescription());
+        entity.setServiceName(alert.getServiceName());
+        entity.setHost(alert.getHost());
+        entity.setDetail(alert.getDetail());
+        entity.setTimestamp(alert.getTimestamp());
+        entity.setProcessed(true);
+        entity.setStatus("CORRELATED");
+        if (taskId != null) {
+            entity.setTaskId(taskId);
+        }
+        entity.setCreateTime(LocalDateTime.now());
+        entity.setFingerprint(fingerprint);
+        entity.setOccurrenceCount(1);
+        return entity;
     }
 }

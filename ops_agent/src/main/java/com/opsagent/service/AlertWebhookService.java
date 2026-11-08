@@ -39,7 +39,6 @@ public class AlertWebhookService {
     private final FingerprintService fingerprintService;
     private final TaskSchedulerService taskScheduler;
     private final MeterRegistry meterRegistry;
-    private final SuppressionPolicy suppressionPolicy;
     private final VerificationFirewall verificationFirewall;
     private final CorrelationService correlationService;
 
@@ -62,7 +61,7 @@ public class AlertWebhookService {
     private Counter webhookResolved;
     private Counter webhookCorrelated;
 
-    @Value("")
+    @Value("${opsagent.webhook.escalation-title-prefix:[严重恶化] }")
     private String escalationTitlePrefix;
 
     @PostConstruct
@@ -148,102 +147,8 @@ public class AlertWebhookService {
         }
 
         // resolved 先处理：先做一次真实恢复验证，确认服务健康才落 RESOLVED。
-        // Alertmanager 的 resolved 可能只是规则恢复/数据抖动，服务实际还在 CrashLoop，
-        // 直接置终态会把假恢复信号当成真正修复。
         if ("resolved".equalsIgnoreCase(alertStatus)) {
-            Mono.fromRunnable(() -> {
-                var list = alertRepository.findByFingerprintOrderByCreateTimeDesc(fingerprint);
-                if (list.isEmpty()) {
-                    log.warn("resolved 但找不到对应告警，fingerprint={}", fingerprint);
-                    return;
-                }
-                AlertEntity e = list.get(0);
-                // 强绑定：该告警关联任务若仍处于观察期、已 REGRESSED，或最终 FAILED/REJECTED，
-                // 一律拒绝关闭告警，并打回未解决。不能因为 Alertmanager 发 resolved 就翻成已解决。
-                Boolean observing = null;
-                try {
-                    observing = taskScheduler.findLatestTaskByAlertId(e.getId())
-                            .map(t -> {
-                                String taskId = t.getId();
-                                String taskStatus = t.getStatus();
-                                if (verificationFirewall.isTaskInObservation(taskId)
-                                        || verificationFirewall.isTaskRegressed(taskId)
-                                        || "FAILED".equalsIgnoreCase(taskStatus)) {
-                                    return Boolean.TRUE;
-                                }
-                                // REJECTED 允许 resolved：人工拒绝不等于当前 CrashLoop 仍在发生，
-                                // 不再用它永久锁死告警终态。
-                                return Boolean.FALSE;
-                            })
-                            .block();
-                } catch (Exception redisOrTaskEx) {
-                    // Redis command timed out / 任务查询异常：不能中断 resolved 全链路。
-                    // observing 按 false 处理，交给下方 verifyServiceHealthy 的真实健康判定
-                    // 来决定是否拒绝假恢复——K8s 不健康照样打回 PENDING，Redis 故障不影响。
-                    log.warn("resolved 强绑定任务查询失败（按不 observing 处理，交给真实健康验证） "
-                                    + "fingerprint={} alertId={}: {}",
-                            fingerprint, e.getId(), redisOrTaskEx.getMessage());
-                }
-                if (Boolean.TRUE.equals(observing)) {
-                    // 强绑定：关联任务未成功结束（观察期/REGRESSED/FAILED）时，resolved 是假信号，
-                    // 打回未解决。日志在改状态后打，避免“保持 CORRELATED”这类误导措辞。
-                    String beforeStatus = e.getStatus();
-                    if (!"PENDING".equalsIgnoreCase(beforeStatus)
-                            && !"FIRING".equalsIgnoreCase(beforeStatus)) {
-                        e.setStatus("PENDING");
-                        e.setProcessed(true);
-                        alertRepository.save(e);
-                        log.warn("强绑定：关联任务未成功结束，忽略 Alertmanager resolved，并打回未解决 "
-                                        + "（原 {}）fingerprint={} alertId={} service={} taskStatusCheck=done",
-                                beforeStatus, fingerprint, e.getId(), e.getServiceName());
-                    } else {
-                        log.warn("强绑定：关联任务未成功结束，告警已处于 {}，忽略 Alertmanager resolved "
-                                        + "fingerprint={} alertId={} service={} taskStatusCheck=done",
-                                beforeStatus, fingerprint, e.getId(), e.getServiceName());
-                    }
-                    return;
-                }
-                // 兼容旧状态：如果告警本身仍是 VERIFYING，也忽略 resolved
-                if ("VERIFYING".equalsIgnoreCase(e.getStatus())) {
-                    log.info("告警 VERIFYING 中，忽略 Alertmanager resolved：fingerprint={} alertId={} service={}",
-                            fingerprint, e.getId(), e.getServiceName());
-                    return;
-                }
-                String serviceName = e.getServiceName();
-                Boolean healthy = verificationFirewall.verifyServiceHealthy(serviceName);
-                if (healthy == null) {
-                    // 探测异常：按保守策略落 RESOLVED，不让校验失败阻塞告警终态
-                    log.warn("resolved 健康验证异常，按正常 resolved 处理 fingerprint={}", fingerprint);
-                    e.setStatus("RESOLVED");
-                    e.setProcessed(true);
-                    alertRepository.save(e);
-                    webhookResolved.increment();
-                } else if (!Boolean.TRUE.equals(healthy)) {
-                    // 服务仍有 CrashLoop/副本未就绪：驳回假恢复信号。K8s 不健康就说明
-                    // 故障很严重（旧改 CORRELATED/ANALYZING/VERIFYING 全是不该有的假终态），
-                    // 必须无条件强制打回 PENDING，让前端亮起红灯重新处理，绝不“保持”原状态。
-                    // 若任务处于 VERIFYING 观察期，也不打断它——由 RecoveryVerificationService
-                    // 观察期决出终态；这里只负责把告警状态钉回未解决。
-                    String beforeStatus = e.getStatus();
-                    e.setStatus("PENDING");
-                    e.setProcessed(true);
-                    try {
-                        alertRepository.save(e);
-                    } catch (Exception saveEx) {
-                        log.warn("[假恢复拦截] 落库 PENDING 失败 alertId={}: {}", e.getId(), saveEx.getMessage());
-                    }
-                    log.warn("[假恢复拦截] 收到 resolved 信号，但 K8s 真实状态仍不健康，强制打回 PENDING（原 {}）"
-                                    + " fingerprint={} alertId={} service={}",
-                            beforeStatus, fingerprint, e.getId(), serviceName);
-                } else {
-                    e.setStatus("RESOLVED");
-                    e.setProcessed(true);
-                    alertRepository.save(e);
-                    webhookResolved.increment();
-                    log.info("告警 resolved，且 K8s 服务 {} 健康，已更新状态 fingerprint={} alertId={}",
-                            serviceName, fingerprint, e.getId());
-                }
-            }).subscribeOn(Schedulers.boundedElastic()).subscribe();
+            handleResolved(alertStatus, fingerprint);
             return;
         }
 
@@ -532,9 +437,9 @@ public class AlertWebhookService {
                 return Boolean.FALSE;
             }
             AlertEntity latest = list.get(0);
-            SuppressionPolicy.SuppressAction action = suppressionPolicy.checkSuppress(latest);
-            if (action == SuppressionPolicy.SuppressAction.COOLDOWN
-                    || action == SuppressionPolicy.SuppressAction.EXHAUSTED) {
+            AlertLifecycleService.SuppressAction action = alertLifecycleService.checkSuppress(latest);
+            if (action == AlertLifecycleService.SuppressAction.COOLDOWN
+                    || action == AlertLifecycleService.SuppressAction.EXHAUSTED) {
                 int next = (latest.getOccurrenceCount() == null ? 1 : latest.getOccurrenceCount()) + 1;
                 latest.setOccurrenceCount(next);
                 // 维持未解决语义：EXHAUSTED 时告警已是 FAILED（人工处理态），COOLDOWN 时是 PENDING
@@ -623,6 +528,112 @@ public class AlertWebhookService {
         alert.setTimestamp(LocalDateTime.now());
         alert.setStatus(status.toUpperCase());
         return alert;
+    }
+
+    /**
+     * 处理 Alertmanager resolved 信号：先做真实恢复验证，确认服务健康才落 RESOLVED。
+     * 独立成方法，避免 handleSingleAlert 过长。
+     */
+    private void handleResolved(String alertStatus, String fingerprint) {
+        Mono.fromRunnable(() -> {
+            var list = alertRepository.findByFingerprintOrderByCreateTimeDesc(fingerprint);
+            if (list.isEmpty()) {
+                log.warn("resolved 但找不到对应告警，fingerprint={}", fingerprint);
+                return;
+            }
+            AlertEntity e = list.get(0);
+            // 强绑定：该告警关联任务若仍处于观察期、已 REGRESSED，或最终 FAILED/REJECTED，
+            // 一律拒绝关闭告警，并打回未解决。不能因为 Alertmanager 发 resolved 就翻成已解决。
+            Boolean observing = null;
+            try {
+                observing = taskScheduler.findLatestTaskByAlertId(e.getId())
+                        .map(t -> {
+                            String taskId = t.getId();
+                            String taskStatus = t.getStatus();
+                            if (verificationFirewall.isTaskInObservation(taskId)
+                                    || verificationFirewall.isTaskRegressed(taskId)
+                                    || "FAILED".equalsIgnoreCase(taskStatus)) {
+                                return Boolean.TRUE;
+                            }
+                            // REJECTED 允许 resolved：人工拒绝不等于当前 CrashLoop 仍在发生，
+                            // 不再用它永久锁死告警终态。
+                            return Boolean.FALSE;
+                        })
+                        .block();
+            } catch (Exception redisOrTaskEx) {
+                // Redis command timed out / 任务查询异常：不能中断 resolved 全链路。
+                // observing 按 false 处理，交给下方 verifyServiceHealthy 的真实健康判定
+                // 来决定是否拒绝假恢复——K8s 不健康照样打回 PENDING，Redis 故障不影响。
+                log.warn("resolved 强绑定任务查询失败（按不 observing 处理，交给真实健康验证） "
+                                + "fingerprint={} alertId={}: {}",
+                        fingerprint, e.getId(), redisOrTaskEx.getMessage());
+            }
+            if (Boolean.TRUE.equals(observing)) {
+                // 强绑定：关联任务未成功结束（观察期/REGRESSED/FAILED）时，resolved 是假信号，
+                // 打回未解决。日志在改状态后打，避免“保持 CORRELATED”这类误导措辞。
+                String beforeStatus = e.getStatus();
+                if (!"PENDING".equalsIgnoreCase(beforeStatus)
+                        && !"FIRING".equalsIgnoreCase(beforeStatus)) {
+                    e.setStatus("PENDING");
+                    e.setProcessed(true);
+                    alertRepository.save(e);
+                    log.warn("强绑定：关联任务未成功结束，忽略 Alertmanager resolved，并打回未解决 "
+                                    + "（原 {}）fingerprint={} alertId={} service={} taskStatusCheck=done",
+                            beforeStatus, fingerprint, e.getId(), e.getServiceName());
+                } else {
+                    log.warn("强绑定：关联任务未成功结束，告警已处于 {}，忽略 Alertmanager resolved "
+                                    + "fingerprint={} alertId={} service={} taskStatusCheck=done",
+                            beforeStatus, fingerprint, e.getId(), e.getServiceName());
+                }
+                return;
+            }
+            // 兼容旧状态：如果告警本身仍是 VERIFYING，也忽略 resolved
+            if ("VERIFYING".equalsIgnoreCase(e.getStatus())) {
+                log.info("告警 VERIFYING 中，忽略 Alertmanager resolved：fingerprint={} alertId={} service={}",
+                        fingerprint, e.getId(), e.getServiceName());
+                return;
+            }
+            String serviceName = e.getServiceName();
+            Boolean healthy = verificationFirewall.verifyServiceHealthy(serviceName);
+            if (healthy == null) {
+                // 探测异常：按保守策略不放行假恢复。K8s 探测本身出错时，
+                // 不能据此判定服务已恢复，否则可能把“服务仍在 CrashLoop”的
+                // 告警误标 RESOLVED，导致前端认为故障已修复。
+                log.warn("resolved 健康验证异常，按假恢复处理并打回 PENDING fingerprint={}", fingerprint);
+                e.setStatus("PENDING");
+                e.setProcessed(true);
+                try {
+                    alertRepository.save(e);
+                } catch (Exception saveEx) {
+                    log.warn("[假恢复拦截] 探测异常下落库 PENDING 失败 alertId={}: {}", e.getId(), saveEx.getMessage());
+                }
+                webhookResolved.increment();
+            } else if (!Boolean.TRUE.equals(healthy)) {
+                // 服务仍有 CrashLoop/副本未就绪：驳回假恢复信号。K8s 不健康就说明
+                // 故障很严重（旧改 CORRELATED/ANALYZING/VERIFYING 全是不该有的假终态），
+                // 必须无条件强制打回 PENDING，让前端亮起红灯重新处理，绝不“保持”原状态。
+                // 若任务处于 VERIFYING 观察期，也不打断它——由 RecoveryVerificationService
+                // 观察期决出终态；这里只负责把告警状态钉回未解决。
+                String beforeStatus = e.getStatus();
+                e.setStatus("PENDING");
+                e.setProcessed(true);
+                try {
+                    alertRepository.save(e);
+                } catch (Exception saveEx) {
+                    log.warn("[假恢复拦截] 落库 PENDING 失败 alertId={}: {}", e.getId(), saveEx.getMessage());
+                }
+                log.warn("[假恢复拦截] 收到 resolved 信号，但 K8s 真实状态仍不健康，强制打回 PENDING（原 {}）"
+                                + " fingerprint={} alertId={} service={}",
+                        beforeStatus, fingerprint, e.getId(), serviceName);
+            } else {
+                e.setStatus("RESOLVED");
+                e.setProcessed(true);
+                alertRepository.save(e);
+                webhookResolved.increment();
+                log.info("告警 resolved，且 K8s 服务 {} 健康，已更新状态 fingerprint={} alertId={}",
+                        serviceName, fingerprint, e.getId());
+            }
+        }).subscribeOn(Schedulers.boundedElastic()).subscribe();
     }
 
 }
