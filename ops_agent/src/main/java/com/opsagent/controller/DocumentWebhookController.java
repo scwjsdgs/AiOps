@@ -40,8 +40,15 @@ public class DocumentWebhookController {
     public Mono<ResponseEntity<ApiResponse<Object>>> receive(@RequestBody(required = false) DocumentChangeEvent event,
                                                              @RequestHeader(value = "X-Doc-Webhook-Token", required = false) String token,
                                                              ServerWebExchange exchange) {
-        if (docsWebhookToken != null && !docsWebhookToken.isBlank()
-                && (token == null || !token.isBlank() && !docsWebhookToken.equals(token))) {
+        // Webhook 无法携带 JWT，必须依赖 X-Doc-Webhook-Token 校验。
+        // 未配置 token 时直接拒绝，避免 webhook 路由无保护暴露（fail-closed）。
+        if (docsWebhookToken == null || docsWebhookToken.isBlank()) {
+            auditLogService.record("RAG", "doc_webhook_auth_failed", "unknown",
+                    "WEBHOOK", event == null ? "" : event.getDocId(), "文档变更 Webhook token 未配置", false);
+            return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(ApiResponse.error(401, "Webhook token not configured")));
+        }
+        if (token == null || token.isBlank() || !docsWebhookToken.equals(token)) {
             auditLogService.record("RAG", "doc_webhook_auth_failed", "unknown",
                     "WEBHOOK", event == null ? "" : event.getDocId(), "文档变更 Webhook token 校验失败", false);
             return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
